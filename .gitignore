@@ -1,0 +1,15 @@
+object/
+*.rds
+*.qs
+
+
+cache/
+
+
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj
+
