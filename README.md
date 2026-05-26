@@ -22,8 +22,7 @@
 
 ## Overview
 
-AtlasLens is a single-file R/Shiny application (`app.R`). It loads one
-integrated single-cell RNA-seq dataset (a Seurat object) and exposes a suite
+AtlasLens is a single-file R/Shiny application (`app.R`). It loads one single-cell RNA-seq atlas or dataset (a Seurat object) and exposes a suite
 of analysis tools through a tabbed interface. Heavy computations (differential expression, geneCOCOA, GO enrichment) run **asynchronously** in
 background workers (via `future` / `promises`), so the interface stays
 responsive, and results are cached on disk (`qs`) for instant retrieval.
@@ -34,7 +33,7 @@ converts Ensembl IDs to symbols via biomaRt when needed, and auto-detects
 metadata role columns (timepoint, condition, cell type, dataset) so it can
 be pointed at any compatible atlas.
 
-The reference dataset is the Tabula Muris atlas; a complementary acute myocardial
+The reference dataset is the Tabula Muris atlas; and a complementary acute myocardial
 infarction (AMI) atlas is used to demonstrate the time-series and
 condition-specific modules.
 
