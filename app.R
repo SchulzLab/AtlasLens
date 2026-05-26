@@ -1538,6 +1538,12 @@ ui <- navbarPage(
                                                        br(), downloadButton("explore_umap_expr_download",
                                                                             "Download (PNG)", class = "btn-success"))
                                               ),
+                                              # Full-width metadata legend rendered as a CSS grid of colour-chip /
+                                              # label pairs. The in-plot legend on the Metadata UMAP is suppressed
+                                              # (see server) so the two UMAPs stay identically square; every
+                                              # category - no matter how many or how long the names - is shown
+                                              # here with its full label and exact swatch colour.
+                                              fluidRow(column(12, uiOutput("explore_umap_meta_legend"))),
                                               fluidRow(column(12, wellPanel(style = "margin-top: 20px;",
                                                                             h4(icon("hand-pointer"), "Cell Inspector", style = "margin-top: 0;"),
                                                                             p("Click a cell on either UMAP to view its metadata."),
@@ -3061,27 +3067,62 @@ server <- function(input, output, session) {
     n_groups <- length(unique(umap_df$group))
     my_palette <- get_expanded_palette(n_groups)
 
-    # Legend tuned for long metadata labels and many categories: wrap labels
-    # at 30 chars, drop legend.text size and key size so a 50+ level
-    # cell-type column still fits inside the plot panel without overflowing.
+    # The in-plot legend is suppressed here: with many cell-type levels it
+    # used to overflow the image border or shrink the plotting panel to an
+    # awkward non-square. The full categorical legend is rendered separately
+    # below the UMAP row (output$explore_umap_meta_legend) as a wide CSS
+    # grid of colour-chip / label pairs where every entry is fully visible.
+    # The PNG export still includes the in-plot legend so the saved image
+    # stays self-contained (see explore_umap_meta_download).
     p <- ggplot(umap_df, aes(x=UMAP_1, y=UMAP_2, color=group)) +
       geom_point(size=1.5, alpha=0.9) +
-      scale_color_manual(values = my_palette,
-                         labels = function(x) stringr::str_wrap(x, width = 30)) +
+      scale_color_manual(values = my_palette) +
       theme_minimal(base_size = 14) +
       labs(title = paste("By", snap$meta_col), subtitle = snap$subtitle) +
-      theme(legend.position = "bottom",
-            legend.box      = "horizontal",
-            legend.text     = element_text(size = 7),
-            legend.key.size = unit(0.3, "cm")) +
-      guides(color = guide_legend(override.aes = list(size = 2)))
+      theme(legend.position = "none")
 
     if (!is.null(explore_zoom_xlim()) && !is.null(explore_zoom_ylim())) {
       p <- p + coord_cartesian(xlim = explore_zoom_xlim(), ylim = explore_zoom_ylim())
     }
     p
   }, res = 110, height = function() input$explore_umap_height %||% 1000)
-  
+
+  # Separate full-width metadata legend. Mirrors the metadata UMAP exactly:
+  # same factor-level order (the order ggplot uses to map colours), same
+  # palette from get_expanded_palette(). Rendered as a CSS grid so the
+  # browser auto-flows the chips into as many columns as fit, then wraps
+  # vertically; long labels are never truncated.
+  output$explore_umap_meta_legend <- renderUI({
+    snap <- umap_snapshot()
+    req(vals$global_plot_data, snap$meta_col)
+    umap_df <- if (!is.null(snap$mask)) vals$global_plot_data[snap$mask, ] else vals$global_plot_data
+    if (is.null(umap_df[[snap$meta_col]])) return(NULL)
+    # Use levels(as.factor(...)) so the chip order matches the plot's
+    # internal factor levels byte-for-byte - same locale, same NA handling.
+    group_factor <- as.factor(umap_df[[snap$meta_col]])
+    groups <- levels(group_factor)
+    n_groups <- length(groups)
+    if (n_groups == 0) return(NULL)
+    palette <- get_expanded_palette(n_groups)
+    chips <- lapply(seq_along(groups), function(i) {
+      div(style = "display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: #ffffff; border: 1px solid #e1e5ea; border-radius: 6px; min-height: 36px;",
+          div(style = sprintf(
+            "width: 22px; height: 22px; flex-shrink: 0; border-radius: 4px; background: %s; border: 1px solid rgba(0,0,0,0.12); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.25);",
+            palette[i])),
+          span(style = "font-size: 13px; color: #2c3e50; line-height: 1.3; word-break: break-word;",
+               groups[i]))
+    })
+    wellPanel(style = "margin-top: 18px; padding: 18px; background: #f8f9fa;",
+              div(style = "display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px;",
+                  h4(icon("palette"), paste(" Legend —", snap$meta_col),
+                     style = "margin: 0; color: #2c3e50;"),
+                  span(style = "color: #7f8c8d; font-size: 13px;",
+                       sprintf("%d %s", n_groups,
+                               if (n_groups == 1) "category" else "categories"))),
+              div(style = "display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 8px;",
+                  chips))
+  })
+
   output$explore_umap_expr <- renderPlot({
     snap <- umap_snapshot()
     req(vals$data, vals$global_plot_data)
@@ -3183,24 +3224,42 @@ server <- function(input, output, session) {
       req(vals$global_plot_data, input$explore_filter_meta_col)
       umap_df <- if (!is.null(vals$explore_mask)) vals$global_plot_data[vals$explore_mask, ] else vals$global_plot_data
       umap_df$group <- as.factor(umap_df[[input$explore_filter_meta_col]])
-      pal <- get_expanded_palette(length(unique(umap_df$group)))
-      # Mirror the on-screen legend tuning so PNG exports keep long labels
-      # legible (str_wrap + small legend keys, bottom horizontal).
+      n_groups <- length(levels(umap_df$group))
+      pal <- get_expanded_palette(n_groups)
+      # Pick a legend column count so the legend tiles into rows-of-N rather
+      # than one giant single column. Numbers tuned for the wide export
+      # canvas below.
+      legend_ncol <- if (n_groups <= 8) n_groups
+                     else if (n_groups <= 30) 5L
+                     else 7L
+      n_rows <- as.integer(ceiling(n_groups / legend_ncol))
       p <- ggplot(umap_df, aes(x = UMAP_1, y = UMAP_2, color = group)) +
-        geom_point(size = 1.2, alpha = 0.9) +
+        geom_point(size = 1.8, alpha = 0.9) +
         scale_color_manual(values = pal,
-                           labels = function(x) stringr::str_wrap(x, width = 30)) +
-        theme_minimal(base_size = 14) +
+                           labels = function(x) stringr::str_wrap(x, width = 35)) +
+        theme_minimal(base_size = 18) +
         labs(title = paste("By", input$explore_filter_meta_col)) +
         theme(legend.position = "bottom",
               legend.box      = "horizontal",
-              plot.title      = element_text(face = "bold"),
-              legend.text     = element_text(size = 7),
-              legend.key.size = unit(0.3, "cm")) +
-        guides(color = guide_legend(override.aes = list(size = 2)))
-      # Generous canvas so the export is not squished compared to the
-      # on-screen view; limitsize = FALSE lifts ggsave's safety cap.
-      ggsave(file, p, width = 14, height = 12, dpi = 300, limitsize = FALSE)
+              plot.title      = element_text(face = "bold", size = 22),
+              legend.text     = element_text(size = 11),
+              legend.title    = element_text(size = 12),
+              legend.key.size = unit(0.55, "cm")) +
+        guides(color = guide_legend(ncol = legend_ncol, byrow = TRUE,
+                                    override.aes = list(size = 4)))
+      # Canvas: the PLOT PANEL is held at ~14 inches square regardless of
+      # legend size, and extra vertical room (n_rows * 0.42 in) is added on
+      # top for the legend rows. Width widens with legend.ncol so labels do
+      # not clip horizontally. dpi = 400 + limitsize = FALSE give a "very
+      # big" export - eg a 50-level cell-type column lands as ~6400 x 7200
+      # pixels with the plot panel itself preserved at full square area.
+      plot_in   <- 14
+      legend_in <- 0.8 + n_rows * 0.42
+      width_in  <- max(16, 2.4 * legend_ncol + 4)
+      total_h   <- plot_in + legend_in
+      ggsave(file, p,
+             width = width_in, height = total_h,
+             dpi = 400, limitsize = FALSE)
     }
   )
   output$explore_umap_expr_download <- downloadHandler(
@@ -3216,8 +3275,13 @@ server <- function(input, output, session) {
         umap_df <- vals$global_plot_data
         expr    <- expr_all
       }
-      ggsave(file, build_expression_umap(umap_df, input$explore_gene, expr),
-             width = 14, height = 12, dpi = 300, limitsize = FALSE)
+      # Expression UMAP has a continuous colour bar (slim), so the canvas
+      # just needs to be big and square. dpi = 400 matches the metadata
+      # export so the two PNGs look like a coherent pair.
+      ggsave(file, build_expression_umap(umap_df, input$explore_gene, expr) +
+               theme_minimal(base_size = 18) +
+               theme(plot.title = element_text(face = "bold", size = 22)),
+             width = 16, height = 14, dpi = 400, limitsize = FALSE)
     }
   )
   
