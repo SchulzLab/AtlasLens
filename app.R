@@ -1441,7 +1441,7 @@ ui <- navbarPage(
                                                                            loadThrottle = 500, maxOptions = 100)),
                                              uiOutput("explore_gene_info"),
                                              sliderInput("explore_umap_height", "Plot height (px):",
-                                                         min = 500, max = 1400, value = 1000, step = 50),
+                                                         min = 500, max = 2400, value = 1000, step = 50),
                                              actionButton("show_umap_plot", "Show Plot",
                                                           icon = icon("eye"), class = "btn-primary btn-block")
                             ),
@@ -3047,20 +3047,20 @@ server <- function(input, output, session) {
     )
   }, ignoreNULL = FALSE)
   
-  output$explore_umap_meta <- renderPlot({ 
+  output$explore_umap_meta <- renderPlot({
     snap <- umap_snapshot()
     req(vals$global_plot_data, snap$meta_col)
-    
+
     # Subset global DF (FAST)
     umap_df <- if (!is.null(snap$mask)) vals$global_plot_data[snap$mask, ] else vals$global_plot_data
-    
+
     # Force explicit factor conversion
     group_data <- umap_df[[snap$meta_col]]
     umap_df$group <- as.factor(group_data)
-    
+
     n_groups <- length(unique(umap_df$group))
     my_palette <- get_expanded_palette(n_groups)
-    
+
     # Legend tuned for long metadata labels and many categories: wrap labels
     # at 30 chars, drop legend.text size and key size so a 50+ level
     # cell-type column still fits inside the plot panel without overflowing.
@@ -3075,7 +3075,7 @@ server <- function(input, output, session) {
             legend.text     = element_text(size = 7),
             legend.key.size = unit(0.3, "cm")) +
       guides(color = guide_legend(override.aes = list(size = 2)))
-    
+
     if (!is.null(explore_zoom_xlim()) && !is.null(explore_zoom_ylim())) {
       p <- p + coord_cartesian(xlim = explore_zoom_xlim(), ylim = explore_zoom_ylim())
     }
@@ -3118,7 +3118,7 @@ server <- function(input, output, session) {
     }
     p
   }, res = 110, height = function() input$explore_umap_height %||% 1000)
-  
+
   # === CLICK METADATA LOGIC ===
   last_explore_click <- reactiveVal(NULL)
   
@@ -3198,7 +3198,9 @@ server <- function(input, output, session) {
               legend.text     = element_text(size = 7),
               legend.key.size = unit(0.3, "cm")) +
         guides(color = guide_legend(override.aes = list(size = 2)))
-      ggsave(file, p, width = 10, height = 9, dpi = 300)
+      # Generous canvas so the export is not squished compared to the
+      # on-screen view; limitsize = FALSE lifts ggsave's safety cap.
+      ggsave(file, p, width = 14, height = 12, dpi = 300, limitsize = FALSE)
     }
   )
   output$explore_umap_expr_download <- downloadHandler(
@@ -3215,7 +3217,7 @@ server <- function(input, output, session) {
         expr    <- expr_all
       }
       ggsave(file, build_expression_umap(umap_df, input$explore_gene, expr),
-             width = 10, height = 9, dpi = 300)
+             width = 14, height = 12, dpi = 300, limitsize = FALSE)
     }
   )
   
