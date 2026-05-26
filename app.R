@@ -1362,6 +1362,58 @@ custom_header <- tags$head(
     /* === FIX CURSOR BLINKING === */
     body { caret-color: transparent; }
     input, textarea, select, .selectize-input { caret-color: auto !important; }
+
+    /* === NOTIFICATIONS: top-centre, wider, errors prominent === */
+    /* Move the whole stack from the default bottom-right corner to the top
+       centre of the viewport so users see error messages immediately. */
+    #shiny-notification-panel {
+      position: fixed !important;
+      top: 18px !important;
+      bottom: auto !important;
+      left: 50% !important;
+      right: auto !important;
+      transform: translateX(-50%);
+      width: auto !important;
+      max-width: 700px;
+      z-index: 99999;
+    }
+    .shiny-notification {
+      width: 640px !important;
+      max-width: 90vw;
+      padding: 16px 20px !important;
+      font-size: 15px !important;
+      line-height: 1.45 !important;
+      border-radius: 8px !important;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.22) !important;
+      margin-bottom: 10px !important;
+      opacity: 1 !important;
+    }
+    /* Error notifications: a stronger red border + slightly larger so they
+       stand out from messages / warnings, and the close button is bigger
+       since errors are persistent (duration = NULL in the server code). */
+    .shiny-notification-error {
+      background-color: #fdecea !important;
+      color: #7b1d13 !important;
+      border-left: 6px solid #e74c3c !important;
+      font-size: 16px !important;
+      font-weight: 500;
+    }
+    .shiny-notification-warning {
+      background-color: #fff8e1 !important;
+      color: #7b5d10 !important;
+      border-left: 6px solid #f1c40f !important;
+    }
+    .shiny-notification-message {
+      background-color: #e8f4fd !important;
+      color: #14517a !important;
+      border-left: 6px solid #3498db !important;
+    }
+    .shiny-notification-close {
+      font-size: 22px !important;
+      line-height: 1 !important;
+      top: 8px !important;
+      right: 12px !important;
+    }
   "))
 )
 
@@ -2143,7 +2195,7 @@ server <- function(input, output, session) {
     } else {
       vals$explore_mask <- NULL
       vals$explore_active_subtitle <- ""
-      showNotification("Filters resulted in 0 cells. Reverting view.", type="error")
+      showNotification("Filters resulted in 0 cells. Reverting view.", type = "error", duration = NULL)
     }
   })
   
@@ -3823,7 +3875,7 @@ server <- function(input, output, session) {
         trimws(raw)
       }
     }, error = function(e) {
-      showNotification(paste("Could not parse uploaded file:", conditionMessage(e)), type = "error")
+      showNotification(paste("Could not parse uploaded file:", conditionMessage(e)), type = "error", duration = NULL)
       character(0)
     })
     # Strip quotes left over from CSV escaping, drop empties / NAs.
@@ -4031,7 +4083,7 @@ server <- function(input, output, session) {
       raw <- trimws(raw)
       raw <- raw[nzchar(raw)]
       if (length(raw) == 0) {
-        showNotification("Uploaded file is empty.", type = "error")
+        showNotification("Uploaded file is empty.", type = "error", duration = NULL)
         vals$go_upload_data <- NULL; return()
       }
       cells <- strsplit(raw, "[[:space:],]+")
@@ -4052,7 +4104,7 @@ server <- function(input, output, session) {
       if (!is.na(fcol)) df$avg_log2FC <- suppressWarnings(as.numeric(getcol(fcol)))
       df <- df[!is.na(df$gene) & nzchar(trimws(df$gene)), , drop = FALSE]
       if (nrow(df) == 0) {
-        showNotification("No genes found in the file.", type = "error")
+        showNotification("No genes found in the file.", type = "error", duration = NULL)
         vals$go_upload_data <- NULL; return()
       }
       vals$go_upload_data <- df
@@ -4061,7 +4113,7 @@ server <- function(input, output, session) {
         msg <- paste(msg, "No fold-change column - only the combined analysis is available.")
       showNotification(msg, type = "message")
     }, error = function(e) {
-      showNotification(paste("File read error:", conditionMessage(e)), type = "error")
+      showNotification(paste("File read error:", conditionMessage(e)), type = "error", duration = NULL)
       vals$go_upload_data <- NULL
     })
   })
@@ -4457,7 +4509,7 @@ server <- function(input, output, session) {
           updateNavbarPage(session, "main_nav", selected = "DEA")
         }
         showNotification("Restored from history!", type = "message")
-      }, error = function(e) showNotification("Error loading history.", type = "error"))
+      }, error = function(e) showNotification("Error loading history.", type = "error", duration = NULL))
     }
   })
   output$history_list <- renderUI({ input$refresh_history; hist <- list_cached_analyses(); if (is.null(hist)) return(p(style = "text-align: center; color: #999;", icon("info-circle"), " No history.")); tagList(lapply(1:nrow(hist), function(i) { h <- hist[i, ]; type_badge <- if(h$type == "COCOA") span(class="type-badge COCOA", "COCOA") else if(h$type == "GO") span(class="type-badge GO", "GO") else span(class="type-badge DEA", "DEA"); div(class = "history-item-row", onclick = paste0("Shiny.setInputValue('trigger_load', '", h$cache_file, "', {priority: 'event'});"), fluidRow(column(8, type_badge, strong(h$gene), br(), span(style="font-size:12px;", h$desc)), column(4, style="text-align:right;", span(style="font-size:10px;", format(h$timestamp, "%m-%d %H:%M"))))) })) })
