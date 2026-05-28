@@ -176,17 +176,54 @@ get_hidden_metadata_columns <- function(seurat_obj) {
 detect_role_columns <- function(meta) {
   cols <- colnames(meta)
   if (length(cols) == 0) return(list())
-  pick <- function(patterns) {
+
+  # A timepoint column must not only be NAMED like a timepoint, its VALUES
+  # must actually look like ordered timepoints. This rejects columns whose
+  # values are ontology identifiers (e.g. "PARO:0000461", "CL:0000236") or
+  # arbitrary free-text labels, which would otherwise yield a meaningless
+  # temporal analysis. Accepts pure numbers, an embedded number
+  # (Day_3, D7, 24h, 7dpi), or a recognised ordinal vocabulary
+  # (baseline/acute/chronic, pre/during/post, ...).
+  is_timepoint_like <- function(values) {
+    v <- as.character(values)
+    v <- v[!is.na(v) & nzchar(v)]
+    v <- v[!tolower(trimws(v)) %in%
+             c("no_data", "no data", "none", "n/a", "na", "unknown", "-")]
+    v <- unique(v)
+    if (length(v) == 0) return(FALSE)
+    # Reject ontology-style identifiers outright (PREFIX:digits, e.g. PARO:0000461).
+    if (any(grepl("^[A-Za-z]+:[0-9]+$", v))) return(FALSE)
+    lt <- tolower(trimws(v))
+    # Stage words that legitimately appear on a time axis without a number
+    # (so a "Control"/"Baseline" reference level alongside Day1/Day3 still counts).
+    ordinal <- c("baseline", "acute", "subacute", "chronic", "control", "ctrl",
+                 "naive", "sham", "mock", "untreated", "pre", "during", "post",
+                 "early", "intermediate", "mid", "middle", "late", "terminal")
+    looks_timed <- function(x) {
+      if (!is.na(suppressWarnings(as.numeric(x)))) return(TRUE)              # 7, 0.5
+      if (!is.na(suppressWarnings(as.numeric(                                # Day_3, 24h, 7dpi
+        sub(".*?(-?[0-9]*\\.?[0-9]+).*", "\\1", x))))) return(TRUE)
+      x %in% ordinal                                                        # baseline/acute/...
+    }
+    # Require a strong majority so categorical columns (cell types, sex, ...)
+    # are still rejected, while tolerating the odd stray label in an otherwise
+    # temporal column.
+    mean(vapply(lt, looks_timed, logical(1))) >= 0.8
+  }
+
+  pick <- function(patterns, validate = NULL) {
     for (p in patterns) {
-      hit <- grep(p, cols, ignore.case = TRUE, value = TRUE)
-      if (length(hit) > 0) return(hit[1])
+      for (h in grep(p, cols, ignore.case = TRUE, value = TRUE)) {
+        if (is.null(validate) || isTRUE(validate(meta[[h]]))) return(h)
+      }
     }
     NULL
   }
   list(
     timepoint = pick(c("^timeseriesinfo$", "^time_series", "^timepoint$",
                        "^time$", "^day$", "^dpi$", "^hpi$",
-                       "_dpi$", "_hpi$", "_hour", "timepoint")),
+                       "_dpi$", "_hpi$", "_hour", "timepoint"),
+                     validate = is_timepoint_like),
     condition = pick(c("^condition$", "^treatment$", "^group$", "^status$",
                        "^genotype$", "^phenotype$", "^disease", "condition")),
     celltype  = pick(c("^celltype_annotated$", "^annotated_celltype$",
@@ -584,14 +621,32 @@ is_ensembl_object <- function(seurat_obj) {
 # future worker; only the (small) ID vector is sent, never the Seurat object.
 run_biomart_query <- function(ens_ids, species) {
   dataset <- if (species == "Homo sapiens") "hsapiens_gene_ensembl" else "mmusculus_gene_ensembl"
-  mart <- biomaRt::useEnsembl(biomart = "genes", dataset = dataset)
-  bm <- biomaRt::getBM(
-    attributes = c("ensembl_gene_id", "external_gene_name"),
-    filters    = "ensembl_gene_id",
-    values     = ens_ids,
-    mart       = mart
-  )
-  bm[!is.na(bm$external_gene_name) & nzchar(bm$external_gene_name), , drop = FALSE]
+  # The "dataset not valid" error users hit is almost always a transient
+  # Ensembl outage on the default host, not a genuinely missing dataset.
+  # Try the main site then the regional mirrors before giving up, and run
+  # the whole query (connect + getBM) per mirror so a mid-query failure also
+  # rolls over to the next one.
+  mirrors  <- c("www", "useast", "asia")
+  last_err <- NULL
+  for (mr in mirrors) {
+    res <- tryCatch({
+      mart <- biomaRt::useEnsembl(biomart = "genes", dataset = dataset, mirror = mr)
+      bm <- biomaRt::getBM(
+        attributes = c("ensembl_gene_id", "external_gene_name"),
+        filters    = "ensembl_gene_id",
+        values     = ens_ids,
+        mart       = mart
+      )
+      bm[!is.na(bm$external_gene_name) & nzchar(bm$external_gene_name), , drop = FALSE]
+    }, error = function(e) { last_err <<- e; NULL })
+    if (!is.null(res)) return(res)
+  }
+  stop("Could not reach Ensembl BioMart for dataset '", dataset, "' after trying ",
+       "mirrors (", paste(mirrors, collapse = ", "), "). This is usually a temporary ",
+       "Ensembl outage or a network/firewall block - please try again shortly. ",
+       "Last error: ",
+       if (!is.null(last_err)) conditionMessage(last_err) else "unknown",
+       call. = FALSE)
 }
 
 # Rebuild a Seurat object's RNA assay under new gene names. Cell-level data
@@ -652,15 +707,34 @@ create_gene_violin_plot <- function(seurat_obj, gene, meta_col, group1, group2, 
   ggplot(df, aes(x = Group, y = Expression, fill = Group)) + geom_violin(alpha = 0.6, scale = "width", trim = FALSE) + geom_jitter(width = 0.2, size = 0.5, alpha = 0.4) + geom_boxplot(width = 0.1, fill = "white", alpha = 0.8, outlier.shape = NA) + scale_fill_manual(values = c("#3498db", "#e74c3c")) + labs(title = paste("Expression Distribution:", gene), y = "Log-Normalized Expression", x = NULL) + theme_minimal(base_size = 14) + theme(legend.position = "none")
 }
 
+# Fast point layer for on-screen UMAP rendering. scattermore rasterises the
+# points in C, which makes large atlases (>100k cells) draw in a fraction of a
+# second instead of the ~20s that the vector geom_point path takes. We fall
+# back to geom_point if scattermore is not installed, so the app still works
+# without it (just slower). For high-resolution downloads we deliberately keep
+# geom_point (raster = FALSE in the callers below) so exported figures stay
+# crisp and vector-clean.
+fast_points <- function(pointsize = 3, alpha = 0.9, pixels = c(2000, 2000)) {
+  if (requireNamespace("scattermore", quietly = TRUE)) {
+    scattermore::geom_scattermore(pointsize = pointsize, alpha = alpha,
+                                  pixels = pixels, na.rm = TRUE)
+  } else {
+    geom_point(size = 1.5, alpha = alpha, na.rm = TRUE)
+  }
+}
+
 # Build a single-gene expression UMAP overlay from a precomputed UMAP dataframe.
 # `df` has UMAP_1, UMAP_2 columns; `expr` is a numeric vector aligned to df rows.
 # Used by the Metadata UMAP and Coexpression subtabs so they look identical.
-build_expression_umap <- function(df, gene_name, expr) {
+# `raster = TRUE` uses the fast scattermore layer (on-screen); set FALSE for
+# downloads to get a crisp vector geom_point rendering.
+build_expression_umap <- function(df, gene_name, expr, limits = NULL, raster = TRUE) {
   df$expr <- as.numeric(expr)
   df <- df[order(df$expr), ]
+  pts <- if (raster) fast_points() else geom_point(size = 1.2, alpha = 0.9, na.rm = TRUE)
   ggplot(df, aes(x = UMAP_1, y = UMAP_2, color = expr)) +
-    geom_point(size = 1.2, alpha = 0.9, na.rm = TRUE) +
-    scale_color_viridis_c(option = "plasma", name = "Expression") +
+    pts +
+    scale_color_viridis_c(option = "plasma", name = "Expression", limits = limits) +
     theme_minimal(base_size = 14) +
     labs(title = paste("Gene:", gene_name)) +
     theme(plot.title = element_text(face = "bold"))
@@ -1319,6 +1393,10 @@ custom_header <- tags$head(
     body { font-family: 'Segoe UI', sans-serif; background-color: #f5f5f5; zoom: 0.65; }
     .irs-line, .irs-grid, .irs-line-mid, .irs-line-left, .irs-line-right { pointer-events: none !important; }
     .irs-handle { pointer-events: auto !important; }
+    /* Applied to a sidebar's config wrapper to freeze every control inside it
+       (no clicks, no dropdowns) while an analysis runs or while a required
+       prerequisite - e.g. Ensembl->symbol conversion - is still pending. */
+    .panel-disabled { pointer-events: none; opacity: 0.5; }
     
     /* === PANELS & BOXES === */
     .title-panel { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 25px; margin-bottom: 25px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
@@ -1678,7 +1756,7 @@ ui <- navbarPage(
                div(class = "progress", style = "height: 8px;", div(class = "progress-bar progress-bar-striped active", style = "width: 100%; background-color: #667eea;"))
            ),
            div(class = "title-panel", h1("Gene Function (COCOA)")),
-           sidebarLayout(sidebarPanel(width = 3, div(class = "section-header", style = "margin-top: 0;", icon("dna"), " 1. Select Gene of Interest"), tags$label("Target Gene:", style = "font-weight: bold;"), info_icon("The gene whose pathway co-regulation you want to analyze."), selectizeInput("analysis_gene", NULL, NULL, options = list(placeholder = "Type to search...", loadThrottle = 500, maxOptions = 100)), uiOutput("analysis_gene_info"), div(class = "section-header", icon("filter"), " 2. Extra Filtering (Optional)"), tags$label("Subset Data:"), info_icon("Apply filters to narrow down the cells"), uiOutput("filter_controls_ui"), uiOutput("active_filters_ui"), div(class = "section-header", icon("columns"), " 3. Group Comparison"), tags$label("Grouping Column:"), info_icon("Select the metadata column defining the groups you want to compare."), selectInput("analysis_meta_col", NULL, choices = NULL), tags$label("Select Groups to Compare:", class = "control-label", style = "font-weight: bold; margin-top: 10px;"), info_icon("Check the specific groups to run analysis on."), uiOutput("analysis_groups_ui"), uiOutput("analysis_cell_count_ui"), hr(), div(class = "section-header", icon("cogs"), " Options"), numericInput("p_val_thresh", "Adjusted P-value threshold:", value = 0.05, min = 0, max = 1, step = 0.001), helpText("Enter a value between 0 and 1."), sliderInput("cocoa_plot_height", "Plot height (px):", min = 400, max = 1400, value = 800, step = 50), br(), uiOutput("run_btn_ui"), br(), uiOutput("download_ui")), mainPanel(width = 9, h3(icon("chart-bar"), " Analysis Results"), uiOutput("analysis_status_msg"), uiOutput("analysis_results_ui")))
+           sidebarLayout(sidebarPanel(width = 3, div(id = "cocoa_config_wrap", div(class = "section-header", style = "margin-top: 0;", icon("dna"), " 1. Select Gene of Interest"), tags$label("Target Gene:", style = "font-weight: bold;"), info_icon("The gene whose pathway co-regulation you want to analyze."), selectizeInput("analysis_gene", NULL, NULL, options = list(placeholder = "Type to search...", loadThrottle = 500, maxOptions = 100)), uiOutput("analysis_gene_info"), div(class = "section-header", icon("filter"), " 2. Extra Filtering (Optional)"), tags$label("Subset Data:"), info_icon("Apply filters to narrow down the cells"), uiOutput("filter_controls_ui"), uiOutput("active_filters_ui"), div(class = "section-header", icon("columns"), " 3. Group Comparison"), tags$label("Grouping Column:"), info_icon("Select the metadata column defining the groups you want to compare."), selectInput("analysis_meta_col", NULL, choices = NULL), tags$label("Select Groups to Compare:", class = "control-label", style = "font-weight: bold; margin-top: 10px;"), info_icon("Check the specific groups to run analysis on."), uiOutput("analysis_groups_ui"), uiOutput("analysis_cell_count_ui"), hr(), div(class = "section-header", icon("cogs"), " Options"), numericInput("p_val_thresh", "Adjusted P-value threshold:", value = 0.05, min = 0, max = 1, step = 0.001), helpText("Enter a value between 0 and 1."), sliderInput("cocoa_plot_height", "Plot height (px):", min = 400, max = 1400, value = 800, step = 50)), br(), uiOutput("run_btn_ui"), br(), uiOutput("download_ui")), mainPanel(width = 9, h3(icon("chart-bar"), " Analysis Results"), uiOutput("analysis_status_msg"), uiOutput("analysis_results_ui")))
   ),
   
   # === DEA ===
@@ -1691,6 +1769,7 @@ ui <- navbarPage(
            ),
            div(class = "title-panel", h1("Differential Expression Analysis")),
            sidebarLayout(sidebarPanel(width = 3, 
+                                      div(id = "dea_config_wrap",
                                       div(class = "section-header", style = "margin-top: 0;", icon("dna"), " 1. Select Gene to Highlight (Optional)"), tags$label("Highlight Gene:", style = "font-weight: bold;"), info_icon("Optional. Select a gene to highlight on the plot."), selectizeInput("dea_gene", NULL, NULL, options = list(placeholder = "Type gene name (optional)...", loadThrottle = 500, maxOptions = 100)), uiOutput("dea_gene_info"), hr(), 
                                       div(class = "section-header", icon("filter"), " 2. Extra Filtering (Optional)"), tags$label("Subset Data:"), info_icon("Narrow down cells for comparison."), uiOutput("dea_filter_controls_ui"), uiOutput("dea_active_filters_ui"), hr(), 
                                       div(class = "section-header", icon("layer-group"), " 3. Select Metadata"), tags$label("Metadata Column:", style = "font-weight: bold;"), info_icon("Choose the column defining conditions."), selectInput("dea_meta_col", NULL, choices = NULL), hr(),
@@ -1720,7 +1799,7 @@ ui <- navbarPage(
                                                 buttonLabel = "Choose file...",
                                                 placeholder = "No file uploaded"),
                                       uiOutput("dea_custom_genes_status_ui"),
-                                      uiOutput("dea_custom_genes_clear_ui"),
+                                      uiOutput("dea_custom_genes_clear_ui")),
                                       br(),
                                       uiOutput("dea_run_btn_ui")),
                          mainPanel(width = 9, h3(icon("chart-line"), " Analysis Results"), uiOutput("dea_status_msg"), uiOutput("dea_results_ui")))
@@ -1738,6 +1817,7 @@ ui <- navbarPage(
            sidebarLayout(
              sidebarPanel(width = 3,
                           # --- Data Source ---
+                          div(id = "go_config_wrap",
                           div(class = "section-header", style = "margin-top: 0;", icon("database"), " 1. Data Source"),
                           radioButtons("go_data_source", NULL, choices = c("Use DEA Results" = "dea", "Upload gene list" = "upload"), selected = "dea", inline = TRUE),
                           conditionalPanel(condition = "input.go_data_source == 'upload'",
@@ -1769,7 +1849,7 @@ ui <- navbarPage(
                           div(class = "section-header", icon("sitemap"), " 4. GO Ontology"),
                           selectInput("go_ontology", "Ontology:", choices = c("Biological Process" = "BP", "Molecular Function" = "MF", "Cellular Component" = "CC"), selected = "BP"),
                           helpText("Species and gene-ID type are detected automatically from your genes."),
-                          hr(),
+                          hr()),
                           # --- Run button ---
                           br(),
                           uiOutput("go_run_btn_ui")
@@ -1802,6 +1882,7 @@ ui <- navbarPage(
                                      selectInput("ts_col_celltype",  "Cell-type column:", choices = NULL),
                                      selectInput("ts_col_dataset",   "Dataset / batch column (optional):", choices = NULL))
                           ),
+                          div(id = "ts_config_wrap",
                           div(class = "section-header", style = "margin-top: 0;", icon("database"), " 1. Select Dataset"),
                           uiOutput("ts_dataset_ui"),
                           uiOutput("ts_dataset_info_ui"),
@@ -1841,9 +1922,25 @@ ui <- navbarPage(
                           sliderInput("ts_violin_height", "Violin Plot height (px):",
                                       min = 400, max = 1200, value = 600, step = 25),
                           actionButton("ts_show_plot", "Show Plot", icon = icon("eye"), class = "btn-primary", style = "width: 100%; margin-top: 15px; margin-bottom: 5px;")
+                          )
              ),
              mainPanel(width = 9,
                        h3(icon("chart-bar"), " Expression Over Time"),
+                       conditionalPanel(
+                         condition = "output.ts_timepoint_available != true",
+                         div(class = "error-box", style = "margin-top: 15px; font-size: 15px;",
+                             icon("circle-info"),
+                             tags$b(" Time Series analysis is not available for this dataset."),
+                             tags$p(style = "margin: 8px 0 0 0; font-weight: normal;",
+                                    "No metadata column with usable timepoint values was detected ",
+                                    "(the temporal modules need ordered timepoints such as numeric ",
+                                    "times, Day_N / Hour_N labels, or a baseline-acute-chronic ladder). ",
+                                    "The controls have been disabled. Every other tab - Dataset ",
+                                    "Exploration, Differential Expression, GO Enrichment and Gene ",
+                                    "Function (COCOA) - works normally."))
+                       ),
+                       conditionalPanel(
+                         condition = "output.ts_timepoint_available == true",
                        uiOutput("ts_summary_table_ui"),
                        tabsetPanel(
                          tabPanel("Heatmap", icon = icon("th"),
@@ -1876,6 +1973,7 @@ ui <- navbarPage(
                                   br(),
                                   uiOutput("ts_download_ui")
                          )
+                       )
                        )
              )
            )
@@ -1915,7 +2013,7 @@ server <- function(input, output, session) {
     # plot, results table, and downloads are restricted to these genes. The
     # Time Series tab's per-cluster CSV export is the canonical producer.
     dea_custom_genes = NULL, dea_custom_genes_filename = NULL,
-    explore_mask = NULL, explore_metadata_filter = list(), 
+    explore_mask = NULL, explore_metadata_filter = list(), ts_timepoint_available = FALSE,
     explore_active_subtitle = "", # Track 'locked' subtitle for plot
     dea_history_pending = NULL, # Used to store pending group selections from history load
     cocoa_history_pending = NULL, # Used to store pending group selections from history load
@@ -2041,6 +2139,10 @@ server <- function(input, output, session) {
     # get_valid_metadata_columns().
     all_meta_cols <- colnames(vals$data@meta.data)
     roles <- detect_role_columns(vals$data@meta.data)
+    # Gate the whole Time Series tab on whether a genuine timepoint column was
+    # found. When none exists, the tab shows an explanatory message and its
+    # controls are disabled rather than silently analysing an arbitrary column.
+    vals$ts_timepoint_available <- !is.null(roles$timepoint)
     role_choices_required <- all_meta_cols
     role_choices_optional <- c("(none)" = "", all_meta_cols)
     updateSelectInput(session, "ts_col_timepoint",
@@ -2195,7 +2297,12 @@ server <- function(input, output, session) {
     } else {
       vals$explore_mask <- NULL
       vals$explore_active_subtitle <- ""
-      showNotification("Filters resulted in 0 cells. Reverting view.", type = "error", duration = NULL)
+      # Not an error: no cell matches the chosen combination, so we simply
+      # fall back to the full view. A brief, self-dismissing warning explains
+      # what happened without leaving a sticky banner on screen.
+      showNotification(
+        "No cells match the current filter combination - showing the full, unfiltered view instead.",
+        type = "warning", duration = 6)
     }
   })
   
@@ -2209,6 +2316,22 @@ server <- function(input, output, session) {
       celltype  = if (isTruthy(input$ts_col_celltype))  input$ts_col_celltype  else NULL,
       dataset   = if (isTruthy(input$ts_col_dataset))   input$ts_col_dataset   else NULL
     )
+  })
+
+  # Expose timepoint availability to the UI so the Time Series main panel can
+  # swap between the analysis tabs and an explanatory "not available" message
+  # via conditionalPanel. suspendWhenHidden = FALSE keeps it evaluated even
+  # while the message branch (which itself references it) is the visible one.
+  output$ts_timepoint_available <- reactive({ isTRUE(vals$ts_timepoint_available) })
+  outputOptions(output, "ts_timepoint_available", suspendWhenHidden = FALSE)
+
+  # Freeze the Time Series sidebar controls when no timepoint column exists.
+  observe({
+    if (isTRUE(vals$ts_timepoint_available)) {
+      shinyjs::removeClass(id = "ts_config_wrap", class = "panel-disabled")
+    } else {
+      shinyjs::addClass(id = "ts_config_wrap", class = "panel-disabled")
+    }
   })
   
   # Dataset selector. If the user mapped a dataset column, render a
@@ -3127,7 +3250,7 @@ server <- function(input, output, session) {
     # The PNG export still includes the in-plot legend so the saved image
     # stays self-contained (see explore_umap_meta_download).
     p <- ggplot(umap_df, aes(x=UMAP_1, y=UMAP_2, color=group)) +
-      geom_point(size=1.5, alpha=0.9) +
+      fast_points() +
       scale_color_manual(values = my_palette) +
       theme_minimal(base_size = 14) +
       labs(title = paste("By", snap$meta_col), subtitle = snap$subtitle) +
@@ -3200,10 +3323,10 @@ server <- function(input, output, session) {
     umap_df$expr <- expr
     umap_df <- umap_df %>% arrange(expr)
     
-    p <- ggplot(umap_df, aes(x=UMAP_1, y=UMAP_2, color=expr)) + 
-      geom_point(size=1.5, alpha=0.9, na.rm = TRUE) + 
-      scale_color_viridis_c(option="plasma", name="Expression") + 
-      theme_minimal(base_size = 14) + 
+    p <- ggplot(umap_df, aes(x=UMAP_1, y=UMAP_2, color=expr)) +
+      fast_points() +
+      scale_color_viridis_c(option="plasma", name="Expression") +
+      theme_minimal(base_size = 14) +
       labs(title = paste("Gene:", snap$gene))
     
     if (!is.null(explore_zoom_xlim()) && !is.null(explore_zoom_ylim())) {
@@ -3330,7 +3453,7 @@ server <- function(input, output, session) {
       # Expression UMAP has a continuous colour bar (slim), so the canvas
       # just needs to be big and square. dpi = 400 matches the metadata
       # export so the two PNGs look like a coherent pair.
-      ggsave(file, build_expression_umap(umap_df, input$explore_gene, expr) +
+      ggsave(file, build_expression_umap(umap_df, input$explore_gene, expr, raster = FALSE) +
                theme_minimal(base_size = 18) +
                theme(plot.title = element_text(face = "bold", size = 22)),
              width = 16, height = 14, dpi = 400, limitsize = FALSE)
@@ -3352,7 +3475,28 @@ server <- function(input, output, session) {
       "Gene 2 (pick a gene)" else paste("Gene 2:", input$coexp_gene_b)
   })
   
-  coexp_gene_plot <- function(gene) {
+  # Shared colour-scale ceiling so the two coexpression UMAPs use the SAME
+  # expression range: a given expression value maps to the same colour in
+  # both panels, which is what makes them visually comparable. Reads whichever
+  # genes are currently selected (respecting the shared cell filter) and
+  # returns c(0, max) across both, or NULL when no valid gene is picked (in
+  # which case each panel falls back to its own auto-range).
+  coexp_shared_limits <- function() {
+    if (is.null(vals$data)) return(NULL)
+    genes <- c(input$coexp_gene_a, input$coexp_gene_b)
+    genes <- genes[!vapply(genes, is.null, logical(1))]
+    genes <- genes[nzchar(genes) & genes %in% rownames(vals$data)]
+    if (length(genes) == 0) return(NULL)
+    mask <- if (!is.null(vals$explore_mask)) vals$explore_mask else rep(TRUE, ncol(vals$data))
+    m <- 0
+    for (g in genes) {
+      e <- GetAssayData(vals$data, layer = "data")[g, ][mask]
+      if (length(e)) m <- max(m, max(e, na.rm = TRUE))
+    }
+    if (!is.finite(m) || m <= 0) NULL else c(0, m)
+  }
+
+  coexp_gene_plot <- function(gene, limits = NULL, raster = TRUE) {
     req(vals$data, vals$global_plot_data)
     if (is.null(gene) || gene == "") {
       return(ggplot() + annotate("text", x = 0.5, y = 0.5,
@@ -3372,25 +3516,29 @@ server <- function(input, output, session) {
       df   <- vals$global_plot_data
       expr <- expr_all
     }
-    build_expression_umap(df, gene, expr)
+    build_expression_umap(df, gene, expr, limits = limits, raster = raster)
   }
-  
+
   output$coexp_umap_g1 <- renderPlot({
     req(input$show_coexp_plot, input$show_coexp_plot > 0)
-    isolate(coexp_gene_plot(input$coexp_gene_a))
+    isolate(coexp_gene_plot(input$coexp_gene_a, limits = coexp_shared_limits()))
   }, res = 110, height = function() input$coexp_plot_height %||% 1000)
   output$coexp_umap_g2 <- renderPlot({
     req(input$show_coexp_plot, input$show_coexp_plot > 0)
-    isolate(coexp_gene_plot(input$coexp_gene_b))
+    isolate(coexp_gene_plot(input$coexp_gene_b, limits = coexp_shared_limits()))
   }, res = 110, height = function() input$coexp_plot_height %||% 1000)
-  
+
   output$coexp_g1_download <- downloadHandler(
     filename = function() paste0("coexp_", isolate(input$coexp_gene_a %||% "gene1"), ".png"),
-    content  = function(file) ggsave(file, coexp_gene_plot(isolate(input$coexp_gene_a)),
+    content  = function(file) ggsave(file, coexp_gene_plot(isolate(input$coexp_gene_a),
+                                                           limits = isolate(coexp_shared_limits()),
+                                                           raster = FALSE),
                                      width = 10, height = 9, dpi = 300))
   output$coexp_g2_download <- downloadHandler(
     filename = function() paste0("coexp_", isolate(input$coexp_gene_b %||% "gene2"), ".png"),
-    content  = function(file) ggsave(file, coexp_gene_plot(isolate(input$coexp_gene_b)),
+    content  = function(file) ggsave(file, coexp_gene_plot(isolate(input$coexp_gene_b),
+                                                           limits = isolate(coexp_shared_limits()),
+                                                           raster = FALSE),
                                      width = 10, height = 9, dpi = 300))
   
   # =========================================================================
@@ -3549,6 +3697,19 @@ server <- function(input, output, session) {
       )
     } else {
       actionButton("run_analysis", "Run geneCOCOA Analysis", class = "btn-primary btn-block btn-lg", icon = icon("play-circle"), style = "font-weight: bold; padding: 12px;")
+    }
+  })
+
+  # Freeze the COCOA sidebar config in two situations: (1) the dataset uses
+  # Ensembl gene IDs and must be converted to symbols first - the conversion
+  # button lives outside this wrapper (in run_btn_ui), so the user is funnelled
+  # to it; (2) an analysis is running, so the run cannot be reconfigured
+  # mid-flight (the Stop button is also outside the wrapper).
+  observe({
+    if (is_ensembl_object(vals$data) || isTRUE(vals$is_analyzing)) {
+      shinyjs::addClass(id = "cocoa_config_wrap", class = "panel-disabled")
+    } else {
+      shinyjs::removeClass(id = "cocoa_config_wrap", class = "panel-disabled")
     }
   })
   
@@ -3803,7 +3964,19 @@ server <- function(input, output, session) {
     } else if(vals$dea_is_analyzing) {
       actionButton("dea_run_analysis_busy", "Processing...", class = "btn-warning btn-block btn-lg disabled", icon = icon("spinner", class="fa-spin"))
     } else {
-      actionButton("dea_run_analysis", "Run Differential Analysis", class = "btn-primary btn-block btn-lg", icon = icon("play-circle"), style = "font-weight: bold;") 
+      actionButton("dea_run_analysis", "Run Differential Analysis", class = "btn-primary btn-block btn-lg", icon = icon("play-circle"), style = "font-weight: bold;")
+    }
+  })
+
+  # Freeze every DEA sidebar control (filters, group pickers, thresholds,
+  # upload) while an analysis is running so the run cannot be reconfigured
+  # mid-flight. The run button itself already shows a disabled "Processing..."
+  # state, so it sits outside this wrapper.
+  observe({
+    if (isTRUE(vals$dea_is_analyzing)) {
+      shinyjs::addClass(id = "dea_config_wrap", class = "panel-disabled")
+    } else {
+      shinyjs::removeClass(id = "dea_config_wrap", class = "panel-disabled")
     }
   })
   
@@ -4132,7 +4305,19 @@ server <- function(input, output, session) {
       actionButton("go_run_analysis", "Run GO Enrichment", class = "btn-success btn-block btn-lg", icon = icon("play-circle"), style = "font-weight: bold;")
     }
   })
-  
+
+  # Freeze the GO sidebar config (data source, mode, thresholds, ontology)
+  # while an enrichment run is in progress so it cannot be reconfigured
+  # mid-flight. The run button sits outside this wrapper and shows its own
+  # disabled "Processing..." state.
+  observe({
+    if (isTRUE(vals$go_is_analyzing)) {
+      shinyjs::addClass(id = "go_config_wrap", class = "panel-disabled")
+    } else {
+      shinyjs::removeClass(id = "go_config_wrap", class = "panel-disabled")
+    }
+  })
+
   # Main analysis trigger
   observeEvent(input$go_run_analysis, {
     req(!vals$go_is_analyzing)
