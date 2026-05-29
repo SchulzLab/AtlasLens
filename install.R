@@ -55,9 +55,6 @@ cran_pkgs <- c(
   "Seurat", "Matrix",
   # plotting
   "ggplot2", "ggrepel", "plotly", "viridis", "RColorBrewer", "patchwork",
-  # fast rasterised point layer for large-atlas UMAPs (optional but recommended;
-  # the app falls back to geom_point if it is absent)
-  "scattermore",
   # data wrangling
   "dplyr", "tidyr",
   # async / caching / misc

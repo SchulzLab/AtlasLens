@@ -707,33 +707,16 @@ create_gene_violin_plot <- function(seurat_obj, gene, meta_col, group1, group2, 
   ggplot(df, aes(x = Group, y = Expression, fill = Group)) + geom_violin(alpha = 0.6, scale = "width", trim = FALSE) + geom_jitter(width = 0.2, size = 0.5, alpha = 0.4) + geom_boxplot(width = 0.1, fill = "white", alpha = 0.8, outlier.shape = NA) + scale_fill_manual(values = c("#3498db", "#e74c3c")) + labs(title = paste("Expression Distribution:", gene), y = "Log-Normalized Expression", x = NULL) + theme_minimal(base_size = 14) + theme(legend.position = "none")
 }
 
-# Fast point layer for on-screen UMAP rendering. scattermore rasterises the
-# points in C, which makes large atlases (>100k cells) draw in a fraction of a
-# second instead of the ~20s that the vector geom_point path takes. We fall
-# back to geom_point if scattermore is not installed, so the app still works
-# without it (just slower). For high-resolution downloads we deliberately keep
-# geom_point (raster = FALSE in the callers below) so exported figures stay
-# crisp and vector-clean.
-fast_points <- function(pointsize = 3, alpha = 0.9, pixels = c(2000, 2000)) {
-  if (requireNamespace("scattermore", quietly = TRUE)) {
-    scattermore::geom_scattermore(pointsize = pointsize, alpha = alpha,
-                                  pixels = pixels, na.rm = TRUE)
-  } else {
-    geom_point(size = 1.5, alpha = alpha, na.rm = TRUE)
-  }
-}
-
 # Build a single-gene expression UMAP overlay from a precomputed UMAP dataframe.
 # `df` has UMAP_1, UMAP_2 columns; `expr` is a numeric vector aligned to df rows.
 # Used by the Metadata UMAP and Coexpression subtabs so they look identical.
-# `raster = TRUE` uses the fast scattermore layer (on-screen); set FALSE for
-# downloads to get a crisp vector geom_point rendering.
-build_expression_umap <- function(df, gene_name, expr, limits = NULL, raster = TRUE) {
+# `limits` optionally fixes the colour-scale range so several panels can share
+# one scale (used by the Coexpression subtab); NULL lets the panel auto-range.
+build_expression_umap <- function(df, gene_name, expr, limits = NULL) {
   df$expr <- as.numeric(expr)
   df <- df[order(df$expr), ]
-  pts <- if (raster) fast_points() else geom_point(size = 1.2, alpha = 0.9, na.rm = TRUE)
   ggplot(df, aes(x = UMAP_1, y = UMAP_2, color = expr)) +
-    pts +
+    geom_point(size = 1.2, alpha = 0.9, na.rm = TRUE) +
     scale_color_viridis_c(option = "plasma", name = "Expression", limits = limits) +
     theme_minimal(base_size = 14) +
     labs(title = paste("Gene:", gene_name)) +
@@ -3215,7 +3198,7 @@ server <- function(input, output, session) {
     explore_zoom_xlim(NULL)
     explore_zoom_ylim(NULL)
   })
-  
+
   # Snapshot the UMAP settings when the user clicks "Show Plot".
   # This isolates the plots from reactive filter changes until the button
   # is pressed again, matching the UX of the other subtabs.
@@ -3250,7 +3233,7 @@ server <- function(input, output, session) {
     # The PNG export still includes the in-plot legend so the saved image
     # stays self-contained (see explore_umap_meta_download).
     p <- ggplot(umap_df, aes(x=UMAP_1, y=UMAP_2, color=group)) +
-      fast_points() +
+      geom_point(size=1.5, alpha=0.9) +
       scale_color_manual(values = my_palette) +
       theme_minimal(base_size = 14) +
       labs(title = paste("By", snap$meta_col), subtitle = snap$subtitle) +
@@ -3310,7 +3293,7 @@ server <- function(input, output, session) {
     
     # Fetch expression data for ALL cells (Fast)
     expr_all <- GetAssayData(vals$data, layer="data")[snap$gene, ]
-    
+
     # Subset if mask exists
     if (!is.null(snap$mask)) {
       umap_df <- vals$global_plot_data[snap$mask, ]
@@ -3319,16 +3302,16 @@ server <- function(input, output, session) {
       umap_df <- vals$global_plot_data
       expr <- expr_all
     }
-    
+
     umap_df$expr <- expr
     umap_df <- umap_df %>% arrange(expr)
-    
+
     p <- ggplot(umap_df, aes(x=UMAP_1, y=UMAP_2, color=expr)) +
-      fast_points() +
+      geom_point(size=1.5, alpha=0.9, na.rm = TRUE) +
       scale_color_viridis_c(option="plasma", name="Expression") +
       theme_minimal(base_size = 14) +
       labs(title = paste("Gene:", snap$gene))
-    
+
     if (!is.null(explore_zoom_xlim()) && !is.null(explore_zoom_ylim())) {
       p <- p + coord_cartesian(xlim = explore_zoom_xlim(), ylim = explore_zoom_ylim())
     }
@@ -3453,7 +3436,7 @@ server <- function(input, output, session) {
       # Expression UMAP has a continuous colour bar (slim), so the canvas
       # just needs to be big and square. dpi = 400 matches the metadata
       # export so the two PNGs look like a coherent pair.
-      ggsave(file, build_expression_umap(umap_df, input$explore_gene, expr, raster = FALSE) +
+      ggsave(file, build_expression_umap(umap_df, input$explore_gene, expr) +
                theme_minimal(base_size = 18) +
                theme(plot.title = element_text(face = "bold", size = 22)),
              width = 16, height = 14, dpi = 400, limitsize = FALSE)
@@ -3496,7 +3479,7 @@ server <- function(input, output, session) {
     if (!is.finite(m) || m <= 0) NULL else c(0, m)
   }
 
-  coexp_gene_plot <- function(gene, limits = NULL, raster = TRUE) {
+  coexp_gene_plot <- function(gene, limits = NULL) {
     req(vals$data, vals$global_plot_data)
     if (is.null(gene) || gene == "") {
       return(ggplot() + annotate("text", x = 0.5, y = 0.5,
@@ -3516,7 +3499,7 @@ server <- function(input, output, session) {
       df   <- vals$global_plot_data
       expr <- expr_all
     }
-    build_expression_umap(df, gene, expr, limits = limits, raster = raster)
+    build_expression_umap(df, gene, expr, limits = limits)
   }
 
   output$coexp_umap_g1 <- renderPlot({
@@ -3531,14 +3514,12 @@ server <- function(input, output, session) {
   output$coexp_g1_download <- downloadHandler(
     filename = function() paste0("coexp_", isolate(input$coexp_gene_a %||% "gene1"), ".png"),
     content  = function(file) ggsave(file, coexp_gene_plot(isolate(input$coexp_gene_a),
-                                                           limits = isolate(coexp_shared_limits()),
-                                                           raster = FALSE),
+                                                           limits = isolate(coexp_shared_limits())),
                                      width = 10, height = 9, dpi = 300))
   output$coexp_g2_download <- downloadHandler(
     filename = function() paste0("coexp_", isolate(input$coexp_gene_b %||% "gene2"), ".png"),
     content  = function(file) ggsave(file, coexp_gene_plot(isolate(input$coexp_gene_b),
-                                                           limits = isolate(coexp_shared_limits()),
-                                                           raster = FALSE),
+                                                           limits = isolate(coexp_shared_limits())),
                                      width = 10, height = 9, dpi = 300))
   
   # =========================================================================
