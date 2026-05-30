@@ -131,7 +131,10 @@ Choose **one** of the three routes below.
 ```bash
 # From the repository root
 docker build -t atlaslens .
-docker run --rm -p 3838:3838 -v "/absolute/path/to/your_dataset.rds:/data/dataset.rds:ro" -e DATASET_PATH=/data/dataset.rds atlaslens
+docker run --rm -p 3838:3838 \
+    -v /absolute/path/to/your_dataset.rds:/data/dataset.rds:ro \
+    -e DATASET_PATH=/data/dataset.rds \
+    atlaslens
 ```
 
 Then open `http://localhost:3838`. The `Dockerfile` pins R 4.3.1 +
