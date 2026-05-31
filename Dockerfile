@@ -17,11 +17,13 @@ RUN apt-get update && apt-get install -y \
     libpng-dev \
     libtiff5-dev \
     libjpeg-dev \
+    libcairo2-dev \
+    libxt-dev \
     git \
     && rm -rf /var/lib/apt/lists/*
 
 
-RUN R -e "install.packages(c('remotes', 'devtools', 'BiocManager', 'Seurat', 'msigdbr', 'shinycssloaders', 'viridis', 'ggrepel', 'digest', 'future', 'promises', 'DT', 'shinyjs', 'qs', 'RColorBrewer', 'plotly', 'patchwork', 'treemap', 'pheatmap'))"
+RUN R -e "install.packages(c('remotes', 'devtools', 'BiocManager', 'Seurat', 'msigdbr', 'shinycssloaders', 'viridis', 'ggrepel', 'digest', 'future', 'promises', 'DT', 'shinyjs', 'qs', 'RColorBrewer', 'plotly', 'patchwork', 'treemap', 'pheatmap', 'ggrastr'))"
 
 RUN R -e "BiocManager::install('gemma.R')"
 

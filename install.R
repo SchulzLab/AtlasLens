@@ -55,10 +55,14 @@ cran_pkgs <- c(
   "Seurat", "Matrix",
   # plotting
   "ggplot2", "ggrepel", "plotly", "viridis", "RColorBrewer", "patchwork",
+  # fast rasterised point layer for the big UMAPs (geom_point_rast)
+  "ggrastr",
   # data wrangling
   "dplyr", "tidyr",
   # async / caching / misc
   "future", "promises", "qs", "digest",
+  # landing-page config loader (reads landing_config.json)
+  "jsonlite",
   # gene sets
   "msigdbr",
   # rendering back-ends used by rrvgo's treemap / heatmap plots

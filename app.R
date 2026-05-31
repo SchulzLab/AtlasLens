@@ -74,9 +74,27 @@ PSEUDOCOUNT <- 0.1
 N_SIMULATIONS <- 100
 MAX_UPLOAD_SIZE <- 20000 
 COCOA_MAX_CELLS <- 500 # Limit cells per group for COCOA speed (Downsampling threshold)
+# Any atomic metadata column with more distinct values than this is treated as a
+# per-cell identifier (e.g. a barcode column) rather than a grouping factor. Such
+# columns are never offered in grouping/colour dropdowns: pushing ~100k choices
+# into a selectInput freezes the browser. The Dataset Overview lists them under a
+# dedicated "High-cardinality" bucket so nothing is silently dropped.
+MAX_LEVELS_FOR_GROUPING <- 1000L
+# On-screen UMAP rasterisation density (ggrastr geom_point_rast). The renderPlot
+# device is ~110 DPI, so a higher raster.dpi supersamples - it computes far more
+# pixels than the screen shows and is actually SLOWER than plain points. Keep
+# this at/below the device DPI for the interactive preview; downloads pass 300
+# explicitly so saved images stay crisp.
+SCREEN_RASTER_DPI <- 72L
 
 options(shiny.maxRequestSize = MAX_UPLOAD_SIZE * 1024^2)
-options(future.globals.maxSize = 800000 * 1024^2) 
+options(future.globals.maxSize = 800000 * 1024^2)
+# Deliberately multicore (NOT multisession): on the Linux cluster this app runs
+# on, multicore workers are forks that share the already-loaded ~110k-cell
+# Seurat object copy-on-write, so geneCOCOA / DEA futures start instantly.
+# multisession spawns fresh R processes that must *serialize* the whole object
+# to each worker, which slowed the app enormously in testing. Do NOT switch this
+# to multisession to "support Windows" - this app is served from Linux.
 plan(multicore, workers = 4)
 
 # === LOGGING & LOCKING ===
@@ -116,9 +134,16 @@ get_valid_metadata_columns <- function(seurat_obj, show_hidden = FALSE) {
   # a toggle so reviewers can inspect everything).
   #
   # Hidden by default:
-  #   * Technical blacklist: per-cell barcode and raw QC counters that the
-  #     app never uses as grouping factors (n_genes, n_counts,
-  #     observation_joinid, nCount_RNA, nFeature_RNA, cell).
+  #   * Technical blacklist: raw QC counters the app never uses as grouping
+  #     factors (n_genes, n_counts, observation_joinid, nCount_RNA,
+  #     nFeature_RNA). These are blacklisted by name because they are numeric
+  #     and semantically not grouping factors.
+  #   * High-cardinality columns: any atomic column with more distinct values
+  #     than MAX_LEVELS_FOR_GROUPING. This generically catches per-cell
+  #     identifiers - e.g. a 'cell' barcode column carried over from an AnnData
+  #     obs index during .h5ad -> Seurat conversion - WITHOUT hard-coding their
+  #     names, so a meaningful low-cardinality column that happens to be named
+  #     'cell' in another dataset is still shown to the user.
   #   * Single-valued columns: any column that takes one value across the
   #     whole object - no analysis can compare across a single group.
   #   * Non-atomic columns (e.g. sf 'geometry' list-columns) - they would
@@ -130,18 +155,26 @@ get_valid_metadata_columns <- function(seurat_obj, show_hidden = FALSE) {
   if (ncol(meta) == 0) return(character())
   cols <- names(meta)
   is_atomic_col <- vapply(cols, function(col) is.atomic(meta[[col]]), logical(1))
-  
-  if (show_hidden) return(cols[is_atomic_col])
-  
+  # High-cardinality atomic columns (more distinct values than the cap) behave
+  # like per-cell identifiers and would freeze the selectize widgets - exclude
+  # them even when the user asks to show hidden columns.
+  is_high_card <- vapply(cols, function(col) {
+    if (!is.atomic(meta[[col]])) return(FALSE)
+    v <- meta[[col]]; v <- v[!is.na(v)]
+    length(unique(v)) > MAX_LEVELS_FOR_GROUPING
+  }, logical(1))
+
+  if (show_hidden) return(cols[is_atomic_col & !is_high_card])
+
   blacklist <- c("n_genes", "n_counts", "observation_joinid",
-                 "nCount_RNA", "nFeature_RNA", "cell")
+                 "nCount_RNA", "nFeature_RNA")
   is_blacklisted <- cols %in% blacklist
   is_single_valued <- vapply(cols, function(col) {
     if (!is.atomic(meta[[col]])) return(FALSE)
     v <- meta[[col]]; v <- v[!is.na(v)]
     length(unique(v)) <= 1L
   }, logical(1))
-  cols[is_atomic_col & !is_blacklisted & !is_single_valued]
+  cols[is_atomic_col & !is_blacklisted & !is_single_valued & !is_high_card]
 }
 
 # Companion: returns the metadata columns hidden by get_valid_metadata_columns
@@ -150,22 +183,30 @@ get_valid_metadata_columns <- function(seurat_obj, show_hidden = FALSE) {
 get_hidden_metadata_columns <- function(seurat_obj) {
   meta <- seurat_obj@meta.data
   empty <- list(technical = character(), single_valued = character(),
-                non_atomic = character())
+                high_cardinality = character(), non_atomic = character())
   if (ncol(meta) == 0) return(empty)
   cols <- names(meta)
   is_atomic_col <- vapply(cols, function(col) is.atomic(meta[[col]]), logical(1))
   blacklist <- c("n_genes", "n_counts", "observation_joinid",
-                 "nCount_RNA", "nFeature_RNA", "cell")
+                 "nCount_RNA", "nFeature_RNA")
+  is_high_card <- vapply(cols, function(col) {
+    if (!is.atomic(meta[[col]])) return(FALSE)
+    v <- meta[[col]]; v <- v[!is.na(v)]
+    length(unique(v)) > MAX_LEVELS_FOR_GROUPING
+  }, logical(1))
   technical    <- cols[is_atomic_col & cols %in% blacklist]
-  single_valued <- cols[is_atomic_col & !(cols %in% blacklist) &
+  single_valued <- cols[is_atomic_col & !(cols %in% blacklist) & !is_high_card &
                           vapply(cols, function(col) {
                             if (!is.atomic(meta[[col]])) return(FALSE)
                             v <- meta[[col]]; v <- v[!is.na(v)]
                             length(unique(v)) <= 1L
                           }, logical(1))]
+  # Hidden purely because they exceed the grouping cap (and not already covered
+  # by the technical blacklist).
+  high_cardinality <- cols[is_atomic_col & !(cols %in% blacklist) & is_high_card]
   non_atomic <- cols[!is_atomic_col]
   list(technical = technical, single_valued = single_valued,
-       non_atomic = non_atomic)
+       high_cardinality = high_cardinality, non_atomic = non_atomic)
 }
 
 # Helper to generate enough distinct colors
@@ -560,12 +601,11 @@ create_go_dotplot <- function(df_list, top_n = 15) {
   p <- ggplot(plot_df, aes(x = GeneRatio, y = Description,
                            size = Count, color = p.adjust)) +
     geom_point() +
-    scale_color_gradient(low = "#e74c3c", high = "#3498db", name = "p.adjust") +
+    scale_color_pvalue(name = "p.adjust") +
     scale_size_continuous(name = "Gene count", range = c(2, 8)) +
     labs(title = "GO Enrichment", x = "GeneRatio", y = NULL) +
-    theme_minimal(base_size = 13) +
-    theme(plot.title = element_text(face = "bold"),
-          axis.text.y = element_text(size = 9))
+    atlas_theme(base_size = 13) +
+    theme(axis.text.y = element_text(size = 9))
   if (length(df_list) > 1) p <- p + facet_wrap(~ Panel, scales = "free_y")
   p
 }
@@ -623,14 +663,30 @@ run_biomart_query <- function(ens_ids, species) {
   dataset <- if (species == "Homo sapiens") "hsapiens_gene_ensembl" else "mmusculus_gene_ensembl"
   # The "dataset not valid" error users hit is almost always a transient
   # Ensembl outage on the default host, not a genuinely missing dataset.
-  # Try the main site then the regional mirrors before giving up, and run
-  # the whole query (connect + getBM) per mirror so a mid-query failure also
-  # rolls over to the next one.
-  mirrors  <- c("www", "useast", "asia")
+  # Try the main site and the regional mirrors first; if the whole rolling
+  # service is down (a site-wide Ensembl blip, as seen in production) fall
+  # back to a pinned, frozen archive. Archive hosts serve a single fixed
+  # release and never geo-redirect, so they stay reachable when the mirrors
+  # don't. may2025 (release 114) is the newest archive that is a genuinely
+  # separate host - the current-release archive just 301s back to www, and
+  # adjacent-release symbol mappings are effectively identical. Run the whole
+  # query (connect + getBM) per connector so a mid-query failure also rolls
+  # over to the next one.
+  connectors <- list(
+    list(label = "mirror 'www'",
+         connect = function() biomaRt::useEnsembl(biomart = "genes", dataset = dataset, mirror = "www")),
+    list(label = "mirror 'useast'",
+         connect = function() biomaRt::useEnsembl(biomart = "genes", dataset = dataset, mirror = "useast")),
+    list(label = "mirror 'asia'",
+         connect = function() biomaRt::useEnsembl(biomart = "genes", dataset = dataset, mirror = "asia")),
+    list(label = "archive 'may2025' (release 114)",
+         connect = function() biomaRt::useEnsembl(biomart = "genes", dataset = dataset,
+                                                  host = "https://may2025.archive.ensembl.org"))
+  )
   last_err <- NULL
-  for (mr in mirrors) {
+  for (conn in connectors) {
     res <- tryCatch({
-      mart <- biomaRt::useEnsembl(biomart = "genes", dataset = dataset, mirror = mr)
+      mart <- conn$connect()
       bm <- biomaRt::getBM(
         attributes = c("ensembl_gene_id", "external_gene_name"),
         filters    = "ensembl_gene_id",
@@ -642,10 +698,57 @@ run_biomart_query <- function(ens_ids, species) {
     if (!is.null(res)) return(res)
   }
   stop("Could not reach Ensembl BioMart for dataset '", dataset, "' after trying ",
-       "mirrors (", paste(mirrors, collapse = ", "), "). This is usually a temporary ",
-       "Ensembl outage or a network/firewall block - please try again shortly. ",
-       "Last error: ",
+       "the regional mirrors (www, useast, asia) and the pinned archive fallback ",
+       "(may2025.archive.ensembl.org). This is usually a temporary Ensembl outage ",
+       "or a network/firewall block - please try again shortly. Last error: ",
        if (!is.null(last_err)) conditionMessage(last_err) else "unknown",
+       call. = FALSE)
+}
+
+# Resolve Ensembl gene IDs -> gene symbols, most-reliable route first:
+#   1. Local Bioconductor OrgDb (org.Mm.eg.db / org.Hs.eg.db). This is offline,
+#      instant, and ALREADY a hard dependency of the GO tab, so it is always
+#      present for mouse and human. No network, so it cannot be taken down by an
+#      Ensembl outage.
+#   2. Live Ensembl BioMart (run_biomart_query) - only as a fallback, when the
+#      local OrgDb is unavailable or maps almost none of the IDs. Ensembl's
+#      BioMart is frequently slow or unreachable, which is exactly the "Ensembl
+#      site unresponsive, trying <x> mirror" hang this ordering avoids.
+# Genes that neither route can map are simply left as their Ensembl ID by the
+# caller, so partial coverage never drops genes. Returns a data.frame with
+# columns (ensembl_gene_id, external_gene_name) keyed on the version-stripped
+# IDs the caller passes in.
+map_ensembl_to_symbol <- function(ens_ids, species) {
+  ens_ids <- unique(ens_ids)
+  org_pkg <- if (species == "Homo sapiens") "org.Hs.eg.db" else "org.Mm.eg.db"
+
+  offline <- NULL
+  if (requireNamespace(org_pkg, quietly = TRUE) &&
+      requireNamespace("AnnotationDbi", quietly = TRUE)) {
+    offline <- tryCatch({
+      orgdb <- getExportedValue(org_pkg, org_pkg)
+      sym <- suppressMessages(suppressWarnings(AnnotationDbi::mapIds(
+        orgdb, keys = ens_ids, column = "SYMBOL",
+        keytype = "ENSEMBL", multiVals = "first")))
+      df <- data.frame(ensembl_gene_id = names(sym),
+                       external_gene_name = unname(sym),
+                       stringsAsFactors = FALSE)
+      df[!is.na(df$external_gene_name) & nzchar(df$external_gene_name), , drop = FALSE]
+    }, error = function(e) NULL)
+  }
+  # Good local coverage -> done, no network call at all.
+  if (!is.null(offline) && nrow(offline) >= 0.5 * length(ens_ids)) return(offline)
+
+  # Otherwise try Ensembl BioMart (broader, but depends on Ensembl being up).
+  online <- tryCatch(run_biomart_query(ens_ids, species), error = function(e) e)
+  if (inherits(online, "data.frame") && nrow(online) > 0) return(online)
+
+  # BioMart unreachable too -> use whatever the local OrgDb managed, even if sparse.
+  if (!is.null(offline) && nrow(offline) > 0) return(offline)
+
+  stop(if (inherits(online, "condition")) conditionMessage(online)
+       else paste0("No Ensembl-to-symbol mappings found in the local '", org_pkg,
+                   "' database, and Ensembl BioMart was unreachable."),
        call. = FALSE)
 }
 
@@ -671,6 +774,49 @@ rename_genes_in_object <- function(seurat_obj, new_names) {
 }
 
 # === PLOTTING & CACHE HELPERS ===
+
+# --- Shared plot styling -----------------------------------------------------
+# One visual language for every matrix / intensity plot (Time Series heatmap,
+# dot plots, expression UMAPs) so they read as a single family. One colour ramp
+# per data meaning:
+#   * magnitude (non-negative: mean expression, % expressing) -> viridis plasma
+#   * signed    (z-scores, log2 fold change)                  -> diverging, 0-centred
+#   * p-values  (smaller = more significant)                  -> viridis, bright = significant
+# Categorical colours come from get_expanded_palette() elsewhere.
+atlas_theme <- function(base_size = 13) {
+  theme_minimal(base_size = base_size) +
+    theme(plot.title        = element_text(face = "bold"),
+          plot.subtitle     = element_text(color = "#5d6d7e"),
+          plot.caption      = element_text(color = "#7f8c8d", size = max(7, base_size - 4)),
+          legend.key.height = grid::unit(0.9, "lines"))
+}
+# Sequential scale for non-negative magnitude (raw mean expression, % expressing).
+scale_fill_expression  <- function(name = "Expression", limits = NULL)
+  scale_fill_viridis_c(option = "plasma", name = name, limits = limits, na.value = "grey90")
+scale_color_expression <- function(name = "Expression", limits = NULL)
+  scale_color_viridis_c(option = "plasma", name = name, limits = limits, na.value = "grey90")
+# Diverging scale for signed quantities, locked symmetric about 0 so white always
+# means "zero / no change" (z-scores, log2 fold change).
+scale_color_zscore <- function(name = "z-score", limits = NULL)
+  scale_color_gradient2(low = "#3b4cc0", mid = "#f7f7f7", high = "#b40426",
+                        midpoint = 0, name = name, limits = limits)
+# Sequential scale for p-values: bright = small p = more significant.
+scale_color_pvalue <- function(name = "p.adjust")
+  scale_color_viridis_c(option = "viridis", direction = -1, name = name)
+
+# Lightweight "nothing rendered yet" panel. UMAP/coexpression plots can take a
+# few seconds on a 100k-cell object, so we no longer draw them on startup -
+# instead we show this prompt until the user clicks the relevant Show Plot
+# button. Rendering a tiny ggplot (rather than leaving the output blank) keeps
+# the layout height stable and gives the user an explicit call to action.
+placeholder_plot <- function(msg = "Click \"Show Plot\" to render this view.") {
+  ggplot() +
+    annotate("text", x = 0, y = 0.18, label = "▶", size = 11, colour = "#bdc3c7") +
+    annotate("text", x = 0, y = -0.12, label = msg, size = 5, colour = "#7f8c8d") +
+    coord_cartesian(xlim = c(-1, 1), ylim = c(-1, 1)) +
+    theme_void()
+}
+
 create_dea_volcano_plot <- function(dea_results, highlight_gene = NULL, p_threshold = 0.05, logfc_threshold = 0.25, filter_list = NULL, show_significant = FALSE) {
   if (is.null(dea_results) || nrow(dea_results) == 0) return(NULL)
   
@@ -707,20 +853,65 @@ create_gene_violin_plot <- function(seurat_obj, gene, meta_col, group1, group2, 
   ggplot(df, aes(x = Group, y = Expression, fill = Group)) + geom_violin(alpha = 0.6, scale = "width", trim = FALSE) + geom_jitter(width = 0.2, size = 0.5, alpha = 0.4) + geom_boxplot(width = 0.1, fill = "white", alpha = 0.8, outlier.shape = NA) + scale_fill_manual(values = c("#3498db", "#e74c3c")) + labs(title = paste("Expression Distribution:", gene), y = "Log-Normalized Expression", x = NULL) + theme_minimal(base_size = 14) + theme(legend.position = "none")
 }
 
+# Rasterised point layer for the big (100k+ cell) UMAPs. ggrastr::geom_point_rast
+# renders the points to a single bitmap at `raster.dpi` and composites that one
+# image, instead of emitting one vector circle per cell - dramatically faster to
+# draw and, because the layer re-rasterises on every render, fully zoom-safe
+# (coord_cartesian zoom redraws crisp points for the new range). Degrades
+# gracefully to geom_point if ggrastr isn't installed.
+umap_point_layer <- function(..., raster.dpi = 300) {
+  if (requireNamespace("ggrastr", quietly = TRUE)) {
+    ggrastr::geom_point_rast(..., raster.dpi = raster.dpi)
+  } else {
+    geom_point(...)
+  }
+}
+
 # Build a single-gene expression UMAP overlay from a precomputed UMAP dataframe.
 # `df` has UMAP_1, UMAP_2 columns; `expr` is a numeric vector aligned to df rows.
 # Used by the Metadata UMAP and Coexpression subtabs so they look identical.
 # `limits` optionally fixes the colour-scale range so several panels can share
 # one scale (used by the Coexpression subtab); NULL lets the panel auto-range.
-build_expression_umap <- function(df, gene_name, expr, limits = NULL) {
+# `raster_dpi` sets the rasterisation density; downloads pass a higher value to
+# match their ggsave dpi.
+build_expression_umap <- function(df, gene_name, expr, limits = NULL, raster_dpi = 300) {
   df$expr <- as.numeric(expr)
   df <- df[order(df$expr), ]
   ggplot(df, aes(x = UMAP_1, y = UMAP_2, color = expr)) +
-    geom_point(size = 1.2, alpha = 0.9, na.rm = TRUE) +
-    scale_color_viridis_c(option = "plasma", name = "Expression", limits = limits) +
+    umap_point_layer(size = 1.2, alpha = 0.9, na.rm = TRUE, raster.dpi = raster_dpi) +
+    scale_color_expression(name = "Expression", limits = limits) +
     theme_minimal(base_size = 14) +
     labs(title = paste("Gene:", gene_name)) +
     theme(plot.title = element_text(face = "bold"))
+}
+
+# Load optional landing-page content from a JSON file the curator places in the
+# app directory (manuscript §2: personalized "introduction" + "dataset
+# information"). No upload and no in-app editor - the file is read once at
+# startup. Expected schema (all fields optional):
+#   { "introduction": "...", "dataset_information": "..." }
+# Search order: $ATLASLENS_LANDING_CONFIG, then landing_config.json in the
+# working directory, then app/landing_config.json. Returns NULL if none is found
+# or the file can't be parsed (the Introduction tab then shows curator guidance).
+load_landing_config <- function() {
+  override   <- Sys.getenv("ATLASLENS_LANDING_CONFIG", "")
+  candidates <- c(if (nzchar(override)) override,
+                  "landing_config.json",
+                  file.path("app", "landing_config.json"))
+  hit <- Filter(file.exists, candidates)
+  if (length(hit) == 0) return(NULL)
+  cfg <- tryCatch(jsonlite::fromJSON(hit[[1]]),
+                  error = function(e) {
+                    warning("AtlasLens: could not parse landing config '",
+                            hit[[1]], "': ", conditionMessage(e))
+                    NULL
+                  })
+  if (is.null(cfg)) return(NULL)
+  # Collapse a string or array-of-strings field into one block of text; NULL out
+  # anything empty so the renderer's nzchar() checks fall through to guidance.
+  pick <- function(x) if (!is.null(x) && length(x) && nzchar(paste(x, collapse = ""))) paste(x, collapse = "\n") else NULL
+  list(introduction       = pick(cfg$introduction),
+       dataset_information = pick(cfg$dataset_information))
 }
 
 # Parse free-text or uploaded gene list. Genes can be on separate lines, or
@@ -908,16 +1099,13 @@ create_multi_gene_dotplot <- function(seurat_obj, genes, group_col,
   fill_label <- if (isTRUE(scale_expression)) "Avg expr (z)" else "Avg expr"
   ggplot(long, aes(x = Group, y = Gene, color = AvgExpr, size = PctExpr)) +
     geom_point() +
-    scale_color_gradient2(low = "#3498db", mid = "white", high = "#e74c3c",
-                          midpoint = if (isTRUE(scale_expression)) 0 else
-                            mean(long$AvgExpr, na.rm = TRUE),
-                          name = fill_label) +
+    (if (isTRUE(scale_expression)) scale_color_zscore(name = fill_label)
+     else scale_color_expression(name = fill_label)) +
     scale_size_continuous(range = c(0, 8), name = "% cells expr.") +
     labs(title = "Multi-gene expression dot plot",
          x = group_col, y = NULL) +
-    theme_minimal(base_size = 13) +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1),
-          plot.title = element_text(face = "bold"))
+    atlas_theme(base_size = 13) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
 }
 
 # === CACHE FUNCTIONS ===
@@ -1368,12 +1556,46 @@ custom_header <- tags$head(
       }, 1000);
     });
     
-    Shiny.addCustomMessageHandler('stop_timer', function(message) { 
-      clearInterval(interval); 
+    Shiny.addCustomMessageHandler('stop_timer', function(message) {
+      clearInterval(interval);
     });
   "),
+  tags$script(HTML("
+    // Lock the 'Show Plot' button in Dataset Exploration while the UMAP plots
+    // render, so a user cannot queue up multiple renders with rapid clicks.
+    // Disabling the button (disabled attr) is what actually blocks new Shiny
+    // input events; it is re-enabled only once both tracked plot outputs finish
+    // (shiny:recalculated) or error (shiny:error). A safety timeout guarantees
+    // the button can never get stuck disabled if a render is skipped via req().
+    (function() {
+      var tracked = ['explore_umap_meta', 'explore_umap_expr'];
+      var pending = 0, timer = null;
+      function btn() { return document.getElementById('show_umap_plot'); }
+      function enable() {
+        pending = 0;
+        if (timer) { clearTimeout(timer); timer = null; }
+        var b = btn();
+        if (b) { b.classList.remove('disabled'); b.removeAttribute('disabled'); }
+      }
+      $(document).on('click', '#show_umap_plot', function() {
+        var b = btn();
+        if (b) { b.classList.add('disabled'); b.setAttribute('disabled', 'disabled'); }
+        pending = tracked.length;
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(enable, 120000);
+      });
+      function done(e) {
+        if (e.target && tracked.indexOf(e.target.id) !== -1 && pending > 0) {
+          pending--;
+          if (pending <= 0) enable();
+        }
+      }
+      $(document).on('shiny:recalculated', done);
+      $(document).on('shiny:error', done);
+    })();
+  ")),
   tags$style(HTML("
-    body { font-family: 'Segoe UI', sans-serif; background-color: #f5f5f5; zoom: 0.65; }
+    body { font-family: 'Segoe UI', sans-serif; background-color: #f5f5f5; zoom: 0.8125; }
     .irs-line, .irs-grid, .irs-line-mid, .irs-line-left, .irs-line-right { pointer-events: none !important; }
     .irs-handle { pointer-events: auto !important; }
     /* Applied to a sidebar's config wrapper to freeze every control inside it
@@ -1504,11 +1726,10 @@ ui <- navbarPage(
              )
            ),
            
-           # Landing content. In the published design this section is
-           # populated from the optional JSON configuration file (manuscript
-           # §2: personalized "introduction" and "dataset information" shown
-           # on the landing page). The JSON loader is not wired up yet, so a
-           # neutral placeholder renders here until a config is supplied.
+           # Landing content, rendered from an optional landing_config.json the
+           # curator places in the app directory (manuscript §2: personalized
+           # "introduction" and "dataset information"). Loaded at startup by
+           # load_landing_config; a guidance panel shows here when absent.
            fluidRow(
              column(12,
                     div(style = "max-width: 800px; margin: 20px auto; color: #555;",
@@ -1739,7 +1960,7 @@ ui <- navbarPage(
                div(class = "progress", style = "height: 8px;", div(class = "progress-bar progress-bar-striped active", style = "width: 100%; background-color: #667eea;"))
            ),
            div(class = "title-panel", h1("Gene Function (COCOA)")),
-           sidebarLayout(sidebarPanel(width = 3, div(id = "cocoa_config_wrap", div(class = "section-header", style = "margin-top: 0;", icon("dna"), " 1. Select Gene of Interest"), tags$label("Target Gene:", style = "font-weight: bold;"), info_icon("The gene whose pathway co-regulation you want to analyze."), selectizeInput("analysis_gene", NULL, NULL, options = list(placeholder = "Type to search...", loadThrottle = 500, maxOptions = 100)), uiOutput("analysis_gene_info"), div(class = "section-header", icon("filter"), " 2. Extra Filtering (Optional)"), tags$label("Subset Data:"), info_icon("Apply filters to narrow down the cells"), uiOutput("filter_controls_ui"), uiOutput("active_filters_ui"), div(class = "section-header", icon("columns"), " 3. Group Comparison"), tags$label("Grouping Column:"), info_icon("Select the metadata column defining the groups you want to compare."), selectInput("analysis_meta_col", NULL, choices = NULL), tags$label("Select Groups to Compare:", class = "control-label", style = "font-weight: bold; margin-top: 10px;"), info_icon("Check the specific groups to run analysis on."), uiOutput("analysis_groups_ui"), uiOutput("analysis_cell_count_ui"), hr(), div(class = "section-header", icon("cogs"), " Options"), numericInput("p_val_thresh", "Adjusted P-value threshold:", value = 0.05, min = 0, max = 1, step = 0.001), helpText("Enter a value between 0 and 1."), sliderInput("cocoa_plot_height", "Plot height (px):", min = 400, max = 1400, value = 800, step = 50)), br(), uiOutput("run_btn_ui"), br(), uiOutput("download_ui")), mainPanel(width = 9, h3(icon("chart-bar"), " Analysis Results"), uiOutput("analysis_status_msg"), uiOutput("analysis_results_ui")))
+           sidebarLayout(sidebarPanel(width = 3, div(id = "cocoa_config_wrap", div(class = "section-header", style = "margin-top: 0;", icon("dna"), " 1. Select Gene of Interest"), tags$label("Target Gene:", style = "font-weight: bold;"), info_icon("The gene whose pathway co-regulation you want to analyze."), selectizeInput("analysis_gene", NULL, NULL, options = list(placeholder = "Type to search...", loadThrottle = 500, maxOptions = 100)), uiOutput("analysis_gene_info"), div(class = "section-header", icon("filter"), " 2. Extra Filtering (Optional)"), tags$label("Subset Data:"), info_icon("Apply filters to narrow down the cells"), uiOutput("filter_controls_ui"), uiOutput("active_filters_ui"), div(class = "section-header", icon("columns"), " 3. Group Comparison"), tags$label("Grouping Column:"), info_icon("Select the metadata column defining the groups you want to compare."), selectInput("analysis_meta_col", NULL, choices = NULL), tags$label("Select Groups to Compare:", class = "control-label", style = "font-weight: bold; margin-top: 10px;"), info_icon("Check the specific groups to run analysis on."), uiOutput("analysis_groups_ui"), uiOutput("analysis_cell_count_ui"), hr(), div(class = "section-header", icon("cogs"), " Options"), numericInput("p_val_thresh", "Adjusted P-value threshold:", value = 0.05, min = 0, max = 1, step = 0.001), helpText("Enter a value between 0 and 1."), sliderInput("cocoa_plot_height", "Plot height (px):", min = 400, max = 1400, value = 800, step = 50)), br(), uiOutput("run_btn_ui")), mainPanel(width = 9, h3(icon("chart-bar"), " Analysis Results"), uiOutput("analysis_status_msg"), uiOutput("analysis_results_ui")))
   ),
   
   # === DEA ===
@@ -2015,16 +2236,37 @@ server <- function(input, output, session) {
     go_upload_data = NULL,
     # geneCOCOA Ensembl-to-symbol conversion state
     cocoa_is_converting = FALSE,
-    # Optional landing-page content from a JSON config (manuscript §2).
-    # NULL until a JSON loader is implemented; the Introduction tab shows a
-    # placeholder while this is NULL.
-    landing_config = NULL
+    # Gene-identifier toggle (item 5): once biomaRt has converted an Ensembl
+    # dataset we keep BOTH objects so the user can flip the displayed identifiers
+    # between gene symbols and the original Ensembl IDs. gene_id_convertible is
+    # FALSE until a conversion happens (the radio is hidden); gene_id_base_hash is
+    # the pre-suffix dataset hash so cache keys stay distinct per mode.
+    gene_id_convertible = FALSE, gene_id_mode = "symbol",
+    data_symbol = NULL, data_ensembl = NULL, gene_id_base_hash = NULL,
+    # Optional landing-page content loaded once at startup from a JSON file the
+    # curator drops in the app directory (see load_landing_config). NULL when no
+    # config is present; the Introduction tab then shows curator guidance.
+    landing_config = load_landing_config()
   )
   
   output$dataset_status_ui <- renderUI({
     if (!is.null(vals$data)) {
-      div(style="color: #27ae60; font-weight: bold; margin-bottom: 20px;",
-          icon("check-circle"), " Dataset Ready")
+      tagList(
+        div(style = if (isTRUE(vals$gene_id_convertible)) "color: #27ae60; font-weight: bold; margin-bottom: 10px;" else "color: #27ae60; font-weight: bold; margin-bottom: 20px;",
+            icon("check-circle"), " Dataset Ready"),
+        # Gene-identifier toggle (item 5): only shown once biomaRt has produced a
+        # symbol mapping, so both representations of the object are in hand. The
+        # swap is handled by observeEvent(input$gene_id_mode); switching back to
+        # Ensembl IDs intentionally re-locks the geneCOCOA tab (it needs symbols).
+        if (isTRUE(vals$gene_id_convertible)) {
+          div(style = "margin-bottom: 20px; padding: 10px 12px; background-color: #eef7ee; border-left: 3px solid #27ae60; border-radius: 3px;",
+              radioButtons("gene_id_mode", "Displayed gene identifiers:",
+                           choices = c("Gene symbols" = "symbol", "Ensembl IDs" = "ensembl"),
+                           selected = vals$gene_id_mode %||% "symbol", inline = TRUE),
+              div(style = "color: #7f8c8d; font-size: 12px; margin-top: 2px;",
+                  "Switching to Ensembl IDs re-locks geneCOCOA (it matches symbol-based gene sets)."))
+        }
+      )
     } else if (is.null(DEFAULT_DATA_PATH)) {
       # No dataset path was provided by the caller. Tell the user how to
       # supply one rather than dressing it up as a load failure.
@@ -2050,13 +2292,10 @@ server <- function(input, output, session) {
     }
   })
   
-  # Landing-page descriptive content. In the published design this is
-  # populated from the optional JSON configuration file (manuscript §2:
-  # personalized "introduction" and "dataset information"). vals$landing_config
-  # stays NULL until that JSON loader is implemented, so a clearly-marked
-  # placeholder renders here in the meantime. When the loader lands, populate
-  # vals$landing_config$introduction / $dataset_information and this output
-  # will render them automatically.
+  # Landing-page descriptive content, populated from the optional JSON config the
+  # curator places in the app directory (loaded once by load_landing_config into
+  # vals$landing_config). When present we render introduction + dataset_information;
+  # otherwise a clearly-marked panel tells the curator how to add it.
   output$landing_content <- renderUI({
     cfg <- vals$landing_config
     has_intro   <- !is.null(cfg) && !is.null(cfg$introduction)   && nzchar(cfg$introduction)
@@ -2073,14 +2312,16 @@ server <- function(input, output, session) {
                              p(cfg$dataset_information))
       )
     } else {
-      # Placeholder shown until a JSON config supplies landing content.
+      # No config found: tell the curator exactly how to add one.
       div(style = "border: 1px dashed #b0b8c4; border-radius: 6px; padding: 18px 20px; background-color: #fafbfc;",
           h3(icon("circle-info"), " Introduction & Dataset Information",
              style = "border-bottom: 2px solid #667eea; padding-bottom: 10px; color: #2c3e50;"),
-          p(style = "color: #7f8c8d; font-style: italic; margin-bottom: 6px;",
-            "Placeholder for landing content."),
-          p(style = "color: #555;",
-            ""))
+          p(style = "color: #555; margin-bottom: 8px;",
+            "To show a custom introduction and dataset description here, place a ",
+            tags$code("landing_config.json"),
+            " file in the app directory. It is read automatically at startup."),
+          tags$pre(style = "background:#f4f6f8; border:1px solid #e1e5ea; border-radius:6px; padding:12px; font-size:12px; color:#2c3e50; white-space:pre-wrap;",
+                   "{\n  \"introduction\": \"Your introduction text...\",\n  \"dataset_information\": \"Cells, samples, processing, citation...\"\n}"))
     }
   })
   
@@ -2147,7 +2388,12 @@ server <- function(input, output, session) {
     show_hidden <- isTRUE(input$show_hidden_metadata)
     visible_cols <- get_valid_metadata_columns(vals$data, show_hidden = show_hidden)
     hidden <- get_hidden_metadata_columns(vals$data)
-    n_hidden_total <- length(hidden$technical) + length(hidden$single_valued) + length(hidden$non_atomic)
+    n_hidden_total <- length(hidden$technical) + length(hidden$single_valued) +
+      length(hidden$high_cardinality) + length(hidden$non_atomic)
+    # High-cardinality and non-atomic columns stay excluded even when the user
+    # disables the filter (they would freeze or break the UI), so report them
+    # separately from the columns that "Show hidden" actually reveals.
+    n_always_excluded <- length(hidden$high_cardinality) + length(hidden$non_atomic)
     
     # Compact "hidden columns" summary so reviewers see exactly what is
     # filtered out. Each category is rendered only if non-empty.
@@ -2164,11 +2410,22 @@ server <- function(input, output, session) {
       p(strong("Genes:"), format(nrow(vals$data), big.mark = ",")),
       p(strong("Metadata columns shown:"),
         paste0(length(visible_cols),
-               if (show_hidden && n_hidden_total > 0) paste0(" (all ", length(visible_cols), " atomic columns - filter disabled)")
+               if (show_hidden && n_always_excluded > 0) paste0(" (filter disabled; ", n_always_excluded, " column(s) still excluded as unusable)")
+               else if (show_hidden && n_hidden_total > 0) " (all atomic columns - filter disabled)"
                else if (n_hidden_total > 0) paste0(" of ", length(visible_cols) + n_hidden_total)
                else "")),
       p(style = "margin-bottom: 4px;", strong("Visible columns: "),
         if (length(visible_cols) == 0) tags$em("(none)") else paste(visible_cols, collapse = ", ")),
+      if (show_hidden && n_always_excluded > 0) {
+        div(style = "margin-top: 10px; padding: 10px; background-color: #fdf6e3; border-left: 3px solid #f39c12; border-radius: 3px;",
+            div(style = "font-weight: bold; color: #b9770e; margin-bottom: 6px;",
+                icon("eye-slash"), sprintf(" %d column(s) cannot be shown even with the filter off", n_always_excluded)),
+            fmt_section("High-cardinality", hidden$high_cardinality,
+                        sprintf("Per-cell identifier columns with more than %s distinct values - offering them as grouping factors would freeze the dropdowns.",
+                                format(MAX_LEVELS_FOR_GROUPING, big.mark = ","))),
+            fmt_section("Non-atomic", hidden$non_atomic,
+                        "List-columns / S4 objects that the UI cannot render."))
+      },
       if (!show_hidden && n_hidden_total > 0) {
         div(style = "margin-top: 10px; padding: 10px; background-color: #fdf6e3; border-left: 3px solid #f39c12; border-radius: 3px;",
             div(style = "font-weight: bold; color: #b9770e; margin-bottom: 6px;",
@@ -2177,6 +2434,9 @@ server <- function(input, output, session) {
                         "Per-cell barcode, raw counts, joinid - never useful as grouping factors."),
             fmt_section("Single-valued", hidden$single_valued,
                         "These columns take exactly one value in this object - no comparison is possible."),
+            fmt_section("High-cardinality", hidden$high_cardinality,
+                        sprintf("Per-cell identifier columns with more than %s distinct values - offering them as grouping factors would freeze the dropdowns.",
+                                format(MAX_LEVELS_FOR_GROUPING, big.mark = ","))),
             fmt_section("Non-atomic", hidden$non_atomic,
                         "List-columns / S4 objects that the UI cannot render."))
       },
@@ -2675,7 +2935,6 @@ server <- function(input, output, session) {
     }
     fill_label   <- "Mean\nexpression"
     caption_str  <- "Mean expression per gene at each timepoint; genes grouped by temporal pattern (k-means)."
-    midpoint_val <- mean(mean_mat, na.rm = TRUE)
     
     # Per-cluster stats: `amplitude` (largest mean-expression swing across
     # timepoints) ranks how dynamic a cluster is; `peak_tp` is the timepoint
@@ -2727,26 +2986,23 @@ server <- function(input, output, session) {
              if (use_all) "; all-genes mode" else "", ")")
     }
     
-    # I switch from geom_tile to geom_raster once there are enough rows that
-    # individual tile borders aren't visible anyway. geom_raster renders the
-    # whole grid as one bitmap, which is dramatically faster for big heatmaps.
-    use_raster <- n_rows > 200
-    
+    # Consistent matrix rendering across AtlasLens: the grid is drawn as a single
+    # bitmap via geom_raster; a thin white tile border is added only for very
+    # small matrices, where cell separation aids reading. Fill is the shared
+    # sequential "expression magnitude" scale (viridis plasma) on raw mean.
     p <- ggplot(long_df, aes(x = Timepoint, y = Gene, fill = Value))
-    p <- if (use_raster) p + geom_raster()
-    else            p + geom_tile(color = "white", linewidth = 0.3)
+    p <- if (n_rows <= 30) p + geom_tile(color = "white", linewidth = 0.3)
+    else                   p + geom_raster()
     p <- p +
-      scale_fill_gradient2(low = "#2166ac", mid = "#f7f7f7", high = "#e08214",
-                           midpoint = midpoint_val, name = fill_label) +
+      scale_fill_expression(name = fill_label) +
       labs(title = title_str,
            subtitle = paste("Condition:", vals$ts_active_condition,
                             "| Cell type:", vals$ts_active_celltype),
            x = paste("Timepoint",
                      if (!is.null(r$timepoint)) paste0("(", r$timepoint, ")") else ""),
            y = NULL, caption = caption_str) +
-      theme_minimal(base_size = 13) +
-      theme(plot.title = element_text(face = "bold"),
-            panel.grid = element_blank())
+      atlas_theme(base_size = 13) +
+      theme(panel.grid = element_blank())
     
     # Facet the heatmap into one labelled band per cluster, so the user sees
     # directly which cluster corresponds to which peak timepoint.
@@ -3210,8 +3466,47 @@ server <- function(input, output, session) {
       subtitle = vals$explore_active_subtitle
     )
   }, ignoreNULL = FALSE)
-  
+
+  # --- Memoized expression-row extraction --------------------------------
+  # Pulling one gene's row out of the sparse 'data' layer for ~100k cells is the
+  # dominant per-render cost on the UMAP / coexpression tabs. Cache the full row
+  # keyed by the active object (dataset_hash) + gene so that (a) re-clicking the
+  # same genes is instant and (b) a gene shared between the two coexpression
+  # panels and the shared-limit calculation is extracted only once instead of
+  # three times. The cache is per-session, bounded, and implicitly invalidated
+  # when dataset_hash changes (new dataset / biomaRt conversion / ID toggle).
+  expr_row_cache <- new.env(parent = emptyenv())
+  get_expr_row <- function(gene) {
+    key <- paste0(vals$dataset_hash %||% "na", "|", gene)
+    hit <- expr_row_cache[[key]]
+    if (!is.null(hit)) return(hit)
+    row <- GetAssayData(vals$data, layer = "data")[gene, ]
+    if (length(ls(expr_row_cache, all.names = TRUE)) >= 16L) {
+      rm(list = ls(expr_row_cache, all.names = TRUE), envir = expr_row_cache)
+    }
+    assign(key, row, envir = expr_row_cache)
+    row
+  }
+
+  # plotOutput(width = "100%") collapses to ~0 px whenever its tab is hidden or
+  # the layout is mid-reflow (e.g. dataset_status_ui re-rendering to add the
+  # gene-id toggle after a biomaRt conversion, or a plain tab switch). On the
+  # next resize Shiny's resizeSavedPlot opens a PNG device at that width and
+  # graphics::plot.new() throws "figure margins too large" because the default
+  # margins no longer fit. Supplying width as a function (instead of the "auto"
+  # default) lets us read the client-reported width - keeping the UMAPs
+  # responsive - while flooring it so the device is always wide enough.
+  safe_plot_width <- function(output_id, min_px = 320L) {
+    w <- session$clientData[[paste0("output_", output_id, "_width")]]
+    if (is.null(w) || !is.finite(w) || w < min_px) min_px else as.integer(w)
+  }
+
   output$explore_umap_meta <- renderPlot({
+    # Do not render on startup: a 100k-cell UMAP costs a few seconds, so we wait
+    # for an explicit click on "Show Plot" and show a prompt until then.
+    if (is.null(input$show_umap_plot) || input$show_umap_plot == 0) {
+      return(placeholder_plot("Click \"Show Plot\" to render the UMAP."))
+    }
     snap <- umap_snapshot()
     req(vals$global_plot_data, snap$meta_col)
 
@@ -3233,7 +3528,7 @@ server <- function(input, output, session) {
     # The PNG export still includes the in-plot legend so the saved image
     # stays self-contained (see explore_umap_meta_download).
     p <- ggplot(umap_df, aes(x=UMAP_1, y=UMAP_2, color=group)) +
-      geom_point(size=1.5, alpha=0.9) +
+      umap_point_layer(size=1.5, alpha=0.9, raster.dpi = SCREEN_RASTER_DPI) +
       scale_color_manual(values = my_palette) +
       theme_minimal(base_size = 14) +
       labs(title = paste("By", snap$meta_col), subtitle = snap$subtitle) +
@@ -3243,7 +3538,9 @@ server <- function(input, output, session) {
       p <- p + coord_cartesian(xlim = explore_zoom_xlim(), ylim = explore_zoom_ylim())
     }
     p
-  }, res = 110, height = function() input$explore_umap_height %||% 1000)
+  }, res = 110,
+     width = function() safe_plot_width("explore_umap_meta"),
+     height = function() input$explore_umap_height %||% 1000)
 
   # Separate full-width metadata legend. Mirrors the metadata UMAP exactly:
   # same factor-level order (the order ggplot uses to map colours), same
@@ -3251,6 +3548,8 @@ server <- function(input, output, session) {
   # browser auto-flows the chips into as many columns as fit, then wraps
   # vertically; long labels are never truncated.
   output$explore_umap_meta_legend <- renderUI({
+    # No legend until the plot itself is rendered (see explore_umap_meta).
+    if (is.null(input$show_umap_plot) || input$show_umap_plot == 0) return(NULL)
     snap <- umap_snapshot()
     req(vals$global_plot_data, snap$meta_col)
     umap_df <- if (!is.null(snap$mask)) vals$global_plot_data[snap$mask, ] else vals$global_plot_data
@@ -3282,6 +3581,9 @@ server <- function(input, output, session) {
   })
 
   output$explore_umap_expr <- renderPlot({
+    if (is.null(input$show_umap_plot) || input$show_umap_plot == 0) {
+      return(placeholder_plot("Click \"Show Plot\" to render the expression UMAP."))
+    }
     snap <- umap_snapshot()
     req(vals$data, vals$global_plot_data)
     if(is.null(snap$gene) || snap$gene == "") {
@@ -3291,8 +3593,8 @@ server <- function(input, output, session) {
     # Check if gene exists in DATA (not filtered object)
     if(!snap$gene %in% rownames(vals$data)) return(NULL); 
     
-    # Fetch expression data for ALL cells (Fast)
-    expr_all <- GetAssayData(vals$data, layer="data")[snap$gene, ]
+    # Fetch expression data for ALL cells (memoized - see get_expr_row)
+    expr_all <- get_expr_row(snap$gene)
 
     # Subset if mask exists
     if (!is.null(snap$mask)) {
@@ -3307,8 +3609,8 @@ server <- function(input, output, session) {
     umap_df <- umap_df %>% arrange(expr)
 
     p <- ggplot(umap_df, aes(x=UMAP_1, y=UMAP_2, color=expr)) +
-      geom_point(size=1.5, alpha=0.9, na.rm = TRUE) +
-      scale_color_viridis_c(option="plasma", name="Expression") +
+      umap_point_layer(size=1.5, alpha=0.9, na.rm = TRUE, raster.dpi = SCREEN_RASTER_DPI) +
+      scale_color_expression(name = "Expression") +
       theme_minimal(base_size = 14) +
       labs(title = paste("Gene:", snap$gene))
 
@@ -3316,7 +3618,9 @@ server <- function(input, output, session) {
       p <- p + coord_cartesian(xlim = explore_zoom_xlim(), ylim = explore_zoom_ylim())
     }
     p
-  }, res = 110, height = function() input$explore_umap_height %||% 1000)
+  }, res = 110,
+     width = function() safe_plot_width("explore_umap_expr"),
+     height = function() input$explore_umap_height %||% 1000)
 
   # === CLICK METADATA LOGIC ===
   last_explore_click <- reactiveVal(NULL)
@@ -3392,7 +3696,7 @@ server <- function(input, output, session) {
                      else 7L
       n_rows <- as.integer(ceiling(n_groups / legend_ncol))
       p <- ggplot(umap_df, aes(x = UMAP_1, y = UMAP_2, color = group)) +
-        geom_point(size = 1.8, alpha = 0.9) +
+        umap_point_layer(size = 1.8, alpha = 0.9, raster.dpi = 400) +
         scale_color_manual(values = pal,
                            labels = function(x) stringr::str_wrap(x, width = 35)) +
         theme_minimal(base_size = 18) +
@@ -3436,7 +3740,7 @@ server <- function(input, output, session) {
       # Expression UMAP has a continuous colour bar (slim), so the canvas
       # just needs to be big and square. dpi = 400 matches the metadata
       # export so the two PNGs look like a coherent pair.
-      ggsave(file, build_expression_umap(umap_df, input$explore_gene, expr) +
+      ggsave(file, build_expression_umap(umap_df, input$explore_gene, expr, raster_dpi = 400) +
                theme_minimal(base_size = 18) +
                theme(plot.title = element_text(face = "bold", size = 22)),
              width = 16, height = 14, dpi = 400, limitsize = FALSE)
@@ -3464,22 +3768,25 @@ server <- function(input, output, session) {
   # genes are currently selected (respecting the shared cell filter) and
   # returns c(0, max) across both, or NULL when no valid gene is picked (in
   # which case each panel falls back to its own auto-range).
-  coexp_shared_limits <- function() {
+  coexp_shared_limits <- function(mask = NULL) {
     if (is.null(vals$data)) return(NULL)
     genes <- c(input$coexp_gene_a, input$coexp_gene_b)
     genes <- genes[!vapply(genes, is.null, logical(1))]
     genes <- genes[nzchar(genes) & genes %in% rownames(vals$data)]
     if (length(genes) == 0) return(NULL)
-    mask <- if (!is.null(vals$explore_mask)) vals$explore_mask else rep(TRUE, ncol(vals$data))
+    if (is.null(mask)) mask <- if (!is.null(vals$explore_mask)) vals$explore_mask else rep(TRUE, ncol(vals$data))
     m <- 0
     for (g in genes) {
-      e <- GetAssayData(vals$data, layer = "data")[g, ][mask]
+      e <- get_expr_row(g)[mask]
       if (length(e)) m <- max(m, max(e, na.rm = TRUE))
     }
     if (!is.finite(m) || m <= 0) NULL else c(0, m)
   }
 
-  coexp_gene_plot <- function(gene, limits = NULL) {
+  # raster_dpi defaults low (150) for the on-screen device - rasterising 100k
+  # points at 300 dpi supersamples a ~110 dpi screen and is actually slower than
+  # drawing fewer pixels. Downloads pass 300 to match their ggsave dpi.
+  coexp_gene_plot <- function(gene, limits = NULL, mask = NULL, raster_dpi = SCREEN_RASTER_DPI) {
     req(vals$data, vals$global_plot_data)
     if (is.null(gene) || gene == "") {
       return(ggplot() + annotate("text", x = 0.5, y = 0.5,
@@ -3491,36 +3798,73 @@ server <- function(input, output, session) {
                                  label = paste("Gene", gene, "not in dataset."),
                                  size = 6, color = "#e67e22") + theme_void())
     }
-    expr_all <- GetAssayData(vals$data, layer = "data")[gene, ]
-    if (!is.null(vals$explore_mask)) {
-      df   <- vals$global_plot_data[vals$explore_mask, ]
-      expr <- expr_all[vals$explore_mask]
+    expr_all <- get_expr_row(gene)
+    if (is.null(mask)) mask <- vals$explore_mask
+    if (!is.null(mask)) {
+      df   <- vals$global_plot_data[mask, ]
+      expr <- expr_all[mask]
     } else {
       df   <- vals$global_plot_data
       expr <- expr_all
     }
-    build_expression_umap(df, gene, expr, limits = limits)
+    build_expression_umap(df, gene, expr, limits = limits, raster_dpi = raster_dpi)
   }
 
+  # Snapshot the coexpression request on each Show Plot click, but only redraw
+  # when it actually differs from what is on screen. observeEvent fires on every
+  # click even with identical inputs (which made re-clicking the same genes pay
+  # for a full redraw); a content-compared reactiveVal skips that. The handler
+  # body is isolated by observeEvent, so it depends solely on the button - the
+  # shared limits are computed once here, not twice per render.
+  coexp_snapshot <- reactiveVal(NULL)
+  observeEvent(input$show_coexp_plot, {
+    req(vals$data)
+    ga <- input$coexp_gene_a %||% ""
+    gb <- input$coexp_gene_b %||% ""
+    mask <- vals$explore_mask
+    cur <- coexp_snapshot()
+    unchanged <- !is.null(cur) && identical(cur$gene_a, ga) &&
+      identical(cur$gene_b, gb) && identical(cur$mask, mask)
+    if (unchanged) return()
+    coexp_snapshot(list(gene_a = ga, gene_b = gb, mask = mask,
+                        limits = coexp_shared_limits(mask = mask)))
+  }, ignoreInit = TRUE)
+
   output$coexp_umap_g1 <- renderPlot({
-    req(input$show_coexp_plot, input$show_coexp_plot > 0)
-    isolate(coexp_gene_plot(input$coexp_gene_a, limits = coexp_shared_limits()))
-  }, res = 110, height = function() input$coexp_plot_height %||% 1000)
+    snap <- coexp_snapshot()
+    if (is.null(snap)) return(placeholder_plot("Click \"Show Plot\" to render the co-expression UMAPs."))
+    coexp_gene_plot(snap$gene_a, limits = snap$limits, mask = snap$mask, raster_dpi = SCREEN_RASTER_DPI)
+  }, res = 110,
+     width = function() safe_plot_width("coexp_umap_g1"),
+     height = function() input$coexp_plot_height %||% 1000)
   output$coexp_umap_g2 <- renderPlot({
-    req(input$show_coexp_plot, input$show_coexp_plot > 0)
-    isolate(coexp_gene_plot(input$coexp_gene_b, limits = coexp_shared_limits()))
-  }, res = 110, height = function() input$coexp_plot_height %||% 1000)
+    snap <- coexp_snapshot()
+    if (is.null(snap)) return(placeholder_plot("Click \"Show Plot\" to render the co-expression UMAPs."))
+    coexp_gene_plot(snap$gene_b, limits = snap$limits, mask = snap$mask, raster_dpi = SCREEN_RASTER_DPI)
+  }, res = 110,
+     width = function() safe_plot_width("coexp_umap_g2"),
+     height = function() input$coexp_plot_height %||% 1000)
 
   output$coexp_g1_download <- downloadHandler(
     filename = function() paste0("coexp_", isolate(input$coexp_gene_a %||% "gene1"), ".png"),
-    content  = function(file) ggsave(file, coexp_gene_plot(isolate(input$coexp_gene_a),
-                                                           limits = isolate(coexp_shared_limits())),
-                                     width = 10, height = 9, dpi = 300))
+    content  = function(file) {
+      snap <- isolate(coexp_snapshot())
+      ga   <- if (!is.null(snap)) snap$gene_a else isolate(input$coexp_gene_a)
+      mask <- if (!is.null(snap)) snap$mask else isolate(vals$explore_mask)
+      lim  <- if (!is.null(snap)) snap$limits else isolate(coexp_shared_limits(mask = mask))
+      ggsave(file, coexp_gene_plot(ga, limits = lim, mask = mask, raster_dpi = 300),
+             width = 10, height = 9, dpi = 300)
+    })
   output$coexp_g2_download <- downloadHandler(
     filename = function() paste0("coexp_", isolate(input$coexp_gene_b %||% "gene2"), ".png"),
-    content  = function(file) ggsave(file, coexp_gene_plot(isolate(input$coexp_gene_b),
-                                                           limits = isolate(coexp_shared_limits())),
-                                     width = 10, height = 9, dpi = 300))
+    content  = function(file) {
+      snap <- isolate(coexp_snapshot())
+      gb   <- if (!is.null(snap)) snap$gene_b else isolate(input$coexp_gene_b)
+      mask <- if (!is.null(snap)) snap$mask else isolate(vals$explore_mask)
+      lim  <- if (!is.null(snap)) snap$limits else isolate(coexp_shared_limits(mask = mask))
+      ggsave(file, coexp_gene_plot(gb, limits = lim, mask = mask, raster_dpi = 300),
+             width = 10, height = 9, dpi = 300)
+    })
   
   # =========================================================================
   # === Dataset Exploration — MULTI-GENE DOT PLOT SUBTAB ===================
@@ -3660,6 +4004,26 @@ server <- function(input, output, session) {
                             class = "btn-warning btn-block btn-lg disabled",
                             icon = icon("spinner", class = "fa-spin")))
       }
+      if (isTRUE(vals$gene_id_convertible)) {
+        # Already converted this session: the symbol object is cached, the user
+        # is just viewing Ensembl IDs. Point them at the toggle rather than
+        # re-querying biomaRt.
+        return(div(class = "error-box", style = "margin-bottom: 10px;",
+                   icon("exclamation-circle"),
+                   " You are viewing Ensembl IDs. Switch \"Displayed gene identifiers\"",
+                   " back to Gene symbols (top of the sidebar) to run geneCOCOA."))
+      }
+      if (!requireNamespace("biomaRt", quietly = TRUE)) {
+        # No biomaRt -> don't offer a convert button that can only fail; the
+        # client-side disable on that button would otherwise have nothing to
+        # restore it.
+        return(div(class = "error-box", style = "margin-bottom: 10px;",
+                   icon("exclamation-circle"),
+                   " This dataset uses Ensembl gene IDs, but biomaRt is not installed",
+                   " in this R environment, so they cannot be converted to the gene",
+                   " symbols geneCOCOA needs. Install Bioconductor's biomaRt and",
+                   " restart AtlasLens."))
+      }
       return(div(
         div(class = "error-box", style = "margin-bottom: 10px;",
             icon("exclamation-circle"),
@@ -3667,9 +4031,24 @@ server <- function(input, output, session) {
             " (its pathway gene sets are symbol-based) - convert them first."),
         actionButton("cocoa_convert_ensembl", "Convert gene IDs to symbols (biomaRt)",
                      class = "btn-info btn-block btn-lg", icon = icon("dna"),
-                     style = "font-weight: bold;")
+                     style = "font-weight: bold;",
+                     # Immediate, client-side feedback. Even when the server
+                     # thread briefly blocks (huge-process fork stall / object
+                     # rebuild), this greys the button and swaps the label on the
+                     # very next tick - so the user always sees a response and
+                     # cannot fire the conversion several times. The setTimeout
+                     # lets Shiny register the click first; run_btn_ui later
+                     # re-renders this button away entirely.
+                     onclick = paste0("var b=this; setTimeout(function(){",
+                                      "b.classList.add('disabled'); b.style.pointerEvents='none';",
+                                      "b.innerHTML='<i class=\"fa fa-spinner fa-spin\"></i> Converting gene IDs… (this can take a minute)';",
+                                      "}, 0);"))
       ))
     }
+    # geneCOCOA analyses a single target gene, so a gene must be chosen before a
+    # run is meaningful. Lock the button (mirrors the "Select Groups First" lock
+    # below) until one is selected; the selectize is empty ("") with no choice.
+    if (is.null(input$analysis_gene) || !nzchar(input$analysis_gene)) return(actionButton("run_analysis_disabled", "Select Gene First", class = "btn-secondary btn-block btn-lg disabled", icon = icon("hand-pointer")))
     if (length(input$analysis_groups) == 0) return(actionButton("run_analysis_disabled", "Select Groups First", class = "btn-secondary btn-block btn-lg disabled", icon = icon("hand-pointer")))
     if (vals$is_analyzing) {
       tagList(
@@ -3707,14 +4086,20 @@ server <- function(input, output, session) {
     orig_ids <- rownames(obj)
     ens_keys <- sub("\\.[0-9]+$", "", orig_ids)
     vals$cocoa_is_converting <- TRUE
-    showNotification("Querying Ensembl BioMart - this can take up to a minute...",
-                     type = "message", duration = 6)
-    
+    # Persistent (duration = NULL) notification with a fixed id so it stays up for
+    # the whole query and is explicitly removed in finally(). When multicore
+    # genuinely forks this surfaces right away; if the platform makes future()
+    # block, the button's client-side onclick disable is the immediate cue and
+    # run_btn_ui swaps to the disabled "Converting..." button on the next flush.
+    showNotification("Mapping Ensembl IDs to gene symbols using the local annotation database (Ensembl BioMart is only contacted if needed)...",
+                     id = "cocoa_convert_msg", type = "message", duration = NULL)
+
     future({
-      run_biomart_query(unique(ens_keys), species)
-    }, globals = list(run_biomart_query = run_biomart_query,
+      map_ensembl_to_symbol(unique(ens_keys), species)
+    }, globals = list(map_ensembl_to_symbol = map_ensembl_to_symbol,
+                      run_biomart_query = run_biomart_query,
                       ens_keys = ens_keys, species = species),
-    packages = "biomaRt", seed = TRUE) %...>% (function(bm) {
+    packages = c("biomaRt", "AnnotationDbi"), seed = TRUE) %...>% (function(bm) {
       if (is.null(bm) || nrow(bm) == 0) {
         showNotification("biomaRt returned no mappings; gene IDs were left unchanged.",
                          type = "warning", duration = 8)
@@ -3731,19 +4116,58 @@ server <- function(input, output, session) {
                          type = "error", duration = 8)
         return()
       }
+      # Keep BOTH representations so the gene-identifier toggle can swap between
+      # them without re-querying biomaRt (item 5). gene_id_base_hash is captured
+      # before the mode suffix so per-mode cache keys stay distinct and stable.
+      vals$data_ensembl       <- obj          # original Ensembl-ID object
+      vals$data_symbol        <- new_obj      # converted gene-symbol object
+      vals$gene_id_base_hash  <- vals$dataset_hash %||% ""
+      vals$gene_id_convertible <- TRUE
+      vals$gene_id_mode       <- "symbol"
       vals$data <- new_obj
-      vals$dataset_hash <- paste0(vals$dataset_hash %||% "", "_sym")
-      showNotification(sprintf("Converted %d of %d genes to symbols. geneCOCOA is ready.",
+      vals$dataset_hash <- paste0(vals$gene_id_base_hash, "_sym")
+      showNotification(sprintf("Converted %d of %d genes to symbols. geneCOCOA is ready - use the gene-identifier toggle to switch back to Ensembl IDs.",
                                n_mapped, length(orig_ids)),
                        type = "message", duration = 8)
     }) %...!% (function(err) {
       showNotification(paste("biomaRt conversion failed:", conditionMessage(err)),
                        type = "error", duration = 10)
     }) %>% finally(function() {
+      # run_btn_ui re-renders a fresh button from scratch once converting flips
+      # back to FALSE, so there is nothing to manually re-enable here.
       vals$cocoa_is_converting <- FALSE
+      removeNotification("cocoa_convert_msg")
     })
   })
-  
+
+  # Gene-identifier toggle (item 5): flip the active object between the cached
+  # gene-symbol and Ensembl-ID representations produced by the biomaRt
+  # conversion. Swapping vals$data triggers the on-load observer that rebuilds
+  # global_plot_data and every gene/metadata dropdown, so the whole app follows
+  # the chosen identifier set. The guard makes a re-emitted (unchanged) radio
+  # event a no-op, which avoids a render<->event feedback loop when
+  # dataset_status_ui re-renders after the swap.
+  observeEvent(input$gene_id_mode, {
+    req(isTRUE(vals$gene_id_convertible))
+    mode <- input$gene_id_mode
+    if (is.null(mode) || identical(mode, vals$gene_id_mode)) return()
+    base <- vals$gene_id_base_hash %||% ""
+    if (identical(mode, "ensembl")) {
+      req(!is.null(vals$data_ensembl))
+      vals$data <- vals$data_ensembl
+      vals$dataset_hash <- paste0(base, "_ens")
+    } else {
+      req(!is.null(vals$data_symbol))
+      vals$data <- vals$data_symbol
+      vals$dataset_hash <- paste0(base, "_sym")
+    }
+    vals$gene_id_mode <- mode
+    # The cached coexpression genes belong to the other identifier set, so drop
+    # the snapshot back to its "click Show Plot" placeholder instead of flashing
+    # a "gene not in dataset" panel.
+    coexp_snapshot(NULL)
+  }, ignoreInit = TRUE)
+
   observeEvent(input$run_analysis, {
     req(input$analysis_gene, input$analysis_groups, !vals$is_analyzing)
     
@@ -3871,20 +4295,24 @@ server <- function(input, output, session) {
   
   
   output$analysis_status_msg <- renderUI({ if(vals$is_analyzing) return(NULL); if(!is.null(vals$error_msg)) return(div(class = "error-box", p(icon("exclamation-triangle"), strong("Error:"), vals$error_msg))); if(!is.null(vals$analysis_res)) return(div(class = "success-box", p(icon("check-circle"), strong("Complete!"), paste("Analyzed", length(vals$analysis_res), "group(s)")))); NULL })
-  output$analysis_results_ui <- renderUI({ req(vals$analysis_res); wellPanel(style = "background-color: #f8f9fa; padding: 10px;", div(id = "plot_container", withSpinner(plotOutput("analysis_plot", height = paste0(input$cocoa_plot_height %||% 800, "px")), type = 6, color = "#3498db"))) })
-  output$analysis_plot <- renderPlot({ req(vals$analysis_res); gene_to_show <- if(!is.null(vals$cocoa_gene_used)) vals$cocoa_gene_used else "Unknown"; filters_to_show <- if(!is.null(vals$cocoa_filters_used)) vals$cocoa_filters_used else list(); res <- vals$analysis_res; plot_df <- bind_rows(lapply(names(res), function(g) { d <- res[[g]]; if(is.null(d)) return(NULL); d <- as.data.frame(d); if(!("geneset" %in% colnames(d))) d$geneset <- rownames(d); tibble(Pathway = gsub("HALLMARK_", "", d$geneset), PVal = if("p.adj" %in% colnames(d)) d$p.adj else d$p, NLP = -log10(PVal), Group = g) })); if (nrow(plot_df) == 0) { plot.new(); text(0.5, 0.5, "No significant pathways.", cex = 1.5); return() }; plot_df_filtered <- plot_df %>% filter(PVal < input$p_val_thresh); if (nrow(plot_df_filtered) == 0) { plot.new(); text(0.5, 0.5, "No pathways below P-value threshold.", cex = 1.5); return() }; filter_str <- "Global Filters: None"; if (length(filters_to_show) > 0) { f_parts <- sapply(filters_to_show, function(f) { val_str <- paste(head(f$vals, 2), collapse=","); if(length(f$vals)>2) val_str <- paste0(val_str, "..."); paste0(f$col, "=(", val_str, ")") }); filter_str <- paste("Global Filters:", paste(f_parts, collapse="; ")) }; ggplot(plot_df_filtered, aes(x = NLP, y = reorder(Pathway, NLP), fill = Group)) + geom_col(position = position_dodge(width = 0.8), width = 0.7, alpha = 0.8) + scale_fill_brewer(palette = "Set2") + labs(title = paste("Co-regulation:", gene_to_show), subtitle = paste0("Comparison: ", vals$analysis_meta$col, "\n", filter_str), x = "-log10(Adjusted P-Value)", y = NULL) + theme_minimal(base_size = 14) + theme(plot.title = element_text(face = "bold", size = 18), legend.position = "bottom") }, height = 800)
-  output$download_ui <- renderUI({
+  output$analysis_results_ui <- renderUI({
     req(vals$analysis_res)
-    div(
-      downloadButton("download_analysis", "Download Plot",
-                     class = "btn-success btn-block",
-                     style = "font-weight: bold;"),
-      downloadButton("download_analysis_script", "Download R script",
-                     class = "btn-default btn-block",
-                     style = "margin-top: 6px;",
-                     title = "Self-contained R script that reproduces this COCOA run from the same dataset.")
+    tagList(
+      # Reproducibility bar above the plot, mirroring the DEA and GO tabs so the
+      # R-script export sits in the same place across analyses (it was previously
+      # a stacked button under "Run Analysis" in the sidebar, which felt inconsistent).
+      div(style = "margin-bottom: 12px; padding: 10px 14px; background-color: #eef5fb; border-left: 4px solid #3498db; border-radius: 3px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap;",
+          span(icon("file-code"), strong(" Reproducibility:"),
+               " download a self-contained R script that re-runs this exact comparison."),
+          downloadButton("download_analysis_script", "Download R script", class = "btn-primary btn-sm")),
+      wellPanel(style = "background-color: #f8f9fa; padding: 10px;",
+                div(id = "plot_container", withSpinner(plotOutput("analysis_plot", height = paste0(input$cocoa_plot_height %||% 800, "px")), type = 6, color = "#3498db"))),
+      # Download Plot below the plot, matching DEA and Time Series.
+      div(style = "margin-top: 15px;",
+          downloadButton("download_analysis", "Download Plot", class = "btn-success"))
     )
   })
+  output$analysis_plot <- renderPlot({ req(vals$analysis_res); gene_to_show <- if(!is.null(vals$cocoa_gene_used)) vals$cocoa_gene_used else "Unknown"; filters_to_show <- if(!is.null(vals$cocoa_filters_used)) vals$cocoa_filters_used else list(); res <- vals$analysis_res; plot_df <- bind_rows(lapply(names(res), function(g) { d <- res[[g]]; if(is.null(d)) return(NULL); d <- as.data.frame(d); if(!("geneset" %in% colnames(d))) d$geneset <- rownames(d); tibble(Pathway = gsub("HALLMARK_", "", d$geneset), PVal = if("p.adj" %in% colnames(d)) d$p.adj else d$p, NLP = -log10(PVal), Group = g) })); if (nrow(plot_df) == 0) { plot.new(); text(0.5, 0.5, "No significant pathways.", cex = 1.5); return() }; plot_df_filtered <- plot_df %>% filter(PVal < input$p_val_thresh); if (nrow(plot_df_filtered) == 0) { plot.new(); text(0.5, 0.5, "No pathways below P-value threshold.", cex = 1.5); return() }; filter_str <- "Global Filters: None"; if (length(filters_to_show) > 0) { f_parts <- sapply(filters_to_show, function(f) { val_str <- paste(head(f$vals, 2), collapse=","); if(length(f$vals)>2) val_str <- paste0(val_str, "..."); paste0(f$col, "=(", val_str, ")") }); filter_str <- paste("Global Filters:", paste(f_parts, collapse="; ")) }; ggplot(plot_df_filtered, aes(x = NLP, y = reorder(Pathway, NLP), fill = Group)) + geom_col(position = position_dodge(width = 0.8), width = 0.7, alpha = 0.8) + scale_fill_brewer(palette = "Set2") + labs(title = paste("Co-regulation:", gene_to_show), subtitle = paste0("Comparison: ", vals$analysis_meta$col, "\n", filter_str), x = "-log10(Adjusted P-Value)", y = NULL) + theme_minimal(base_size = 14) + theme(plot.title = element_text(face = "bold", size = 18), legend.position = "bottom") }, height = 800)
   output$download_analysis <- downloadHandler(filename = function() paste0("cocoa_", input$analysis_gene, ".png"), content = function(file) ggsave(file, width = 12, height = 9))
   output$download_analysis_script <- downloadHandler(
     filename = function() paste0("atlaslens_cocoa_", input$analysis_gene %||% "gene", "_reproduce.R"),
