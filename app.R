@@ -488,9 +488,15 @@ run_dea_worker <- function(subset_counts, subset_meta, meta_col, group1, group2)
   suppressMessages({
     suppressWarnings({
       Seurat::Idents(mini_seurat) <- mini_seurat@meta.data[[meta_col]]
+      # logfc.threshold = 0 returns ALL tested genes - both up- and down-
+      # regulated, at any effect size - so the volcano and results table show
+      # the full distribution rather than a pre-filtered slice. Effect-size
+      # filtering is applied later at display time via the sidebar cutoff.
+      # min.pct = 0.1 keeps the standard detection filter (gene seen in >=10%
+      # of cells in at least one group).
       markers <- Seurat::FindMarkers(mini_seurat, ident.1 = group1, ident.2 = group2,
                                      test.use = "wilcox", use_presto = TRUE,
-                                     logfc.threshold = 0.585, min.pct = 0.1, verbose = FALSE,
+                                     logfc.threshold = 0, min.pct = 0.1, verbose = FALSE,
                                      assay = "RNA", slot = "data", recorrect_umi = FALSE)
     })
   })
@@ -591,6 +597,10 @@ create_go_dotplot <- function(df_list, top_n = 15) {
                     function(x) as.numeric(x[1]) / as.numeric(x[2]), numeric(1))
     data.frame(Description = d$Description, GeneRatio = ratio,
                Count = d$Count, p.adjust = d$p.adjust,
+               # -log10 transform so the legend is readable: raw adjusted
+               # p-values are tiny (e.g. 1e-20). pmin caps the rare underflow
+               # of p.adjust to 0 (-log10(0) = Inf).
+               neglog_padj = pmin(-log10(d$p.adjust), 300),
                Panel = nm, stringsAsFactors = FALSE)
   })
   plot_df <- do.call(rbind, parts)
@@ -599,9 +609,9 @@ create_go_dotplot <- function(df_list, top_n = 15) {
     plot_df$Description,
     levels = unique(plot_df$Description[order(plot_df$GeneRatio)]))
   p <- ggplot(plot_df, aes(x = GeneRatio, y = Description,
-                           size = Count, color = p.adjust)) +
+                           size = Count, color = neglog_padj)) +
     geom_point() +
-    scale_color_pvalue(name = "p.adjust") +
+    scale_color_viridis_c(option = "viridis", name = "-log10(p.adjust)") +
     scale_size_continuous(name = "Gene count", range = c(2, 8)) +
     labs(title = "GO Enrichment", x = "GeneRatio", y = NULL) +
     atlas_theme(base_size = 13) +
@@ -675,6 +685,8 @@ run_biomart_query <- function(ens_ids, species) {
   connectors <- list(
     list(label = "mirror 'www'",
          connect = function() biomaRt::useEnsembl(biomart = "genes", dataset = dataset, mirror = "www")),
+    list(label = "mirror 'uswest'",
+         connect = function() biomaRt::useEnsembl(biomart = "genes", dataset = dataset, mirror = "uswest")),
     list(label = "mirror 'useast'",
          connect = function() biomaRt::useEnsembl(biomart = "genes", dataset = dataset, mirror = "useast")),
     list(label = "mirror 'asia'",
@@ -698,7 +710,7 @@ run_biomart_query <- function(ens_ids, species) {
     if (!is.null(res)) return(res)
   }
   stop("Could not reach Ensembl BioMart for dataset '", dataset, "' after trying ",
-       "the regional mirrors (www, useast, asia) and the pinned archive fallback ",
+       "the regional mirrors (www, uswest, useast, asia) and the pinned archive fallback ",
        "(may2025.archive.ensembl.org). This is usually a temporary Ensembl outage ",
        "or a network/firewall block - please try again shortly. Last error: ",
        if (!is.null(last_err)) conditionMessage(last_err) else "unknown",
@@ -817,15 +829,24 @@ placeholder_plot <- function(msg = "Click \"Show Plot\" to render this view.") {
     theme_void()
 }
 
-create_dea_volcano_plot <- function(dea_results, highlight_gene = NULL, p_threshold = 0.05, logfc_threshold = 0.25, filter_list = NULL, show_significant = FALSE) {
+create_dea_volcano_plot <- function(dea_results, highlight_gene = NULL, p_threshold = 0.05, logfc_down = -0.585, logfc_up = 0.585, filter_list = NULL, show_significant = FALSE) {
   if (is.null(dea_results) || nrow(dea_results) == 0) return(NULL)
-  
+  # Two independent effect-size cutoffs (down/up). A gene is "significant" when
+  # its p_val_adj clears the threshold AND its log2FC sits beyond one of the two
+  # vertical lines (<= down OR >= up). All genes stay plotted; the cutoffs only
+  # colour points. Guard against blank/NA boxes so the plot never errors out.
+  if (is.null(logfc_down) || is.na(logfc_down)) logfc_down <- -0.585
+  if (is.null(logfc_up)   || is.na(logfc_up))   logfc_up   <- 0.585
+
   if (show_significant) {
-    dea_results <- dea_results %>% filter(p_val_adj < p_threshold & abs(avg_log2FC) > logfc_threshold)
+    dea_results <- dea_results %>% filter(p_val_adj < p_threshold & (avg_log2FC <= logfc_down | avg_log2FC >= logfc_up))
   }
-  
-  plot_df <- dea_results %>% mutate(NegLogP = -log10(p_val_adj), NegLogP = ifelse(is.infinite(NegLogP), 300, NegLogP), Significant = p_val_adj < p_threshold & abs(avg_log2FC) > logfc_threshold, IsHighlight = if (!is.null(highlight_gene) && highlight_gene != "") gene == highlight_gene else FALSE) %>% arrange(IsHighlight)
-  top_genes <- head(plot_df$gene, 10)
+
+  plot_df <- dea_results %>% mutate(NegLogP = -log10(p_val_adj), NegLogP = ifelse(is.infinite(NegLogP), 300, NegLogP), Significant = p_val_adj < p_threshold & (avg_log2FC <= logfc_down | avg_log2FC >= logfc_up), IsHighlight = if (!is.null(highlight_gene) && highlight_gene != "") gene == highlight_gene else FALSE) %>% arrange(IsHighlight)
+  # Label the 10 most relevant genes, not just the first 10 rows: sort by
+  # adjusted p-value, breaking ties by larger absolute fold change. Done on a
+  # copy so plot_df keeps its IsHighlight draw order (highlighted point on top).
+  top_genes <- plot_df %>% arrange(p_val_adj, desc(abs(avg_log2FC))) %>% head(10) %>% pull(gene)
   label_genes <- if (!is.null(highlight_gene) && highlight_gene != "") unique(c(top_genes, highlight_gene)) else top_genes
   plot_df$Label <- ifelse(plot_df$gene %in% label_genes, plot_df$gene, NA)
   filter_str <- "Global Filters: None"
@@ -834,11 +855,11 @@ create_dea_volcano_plot <- function(dea_results, highlight_gene = NULL, p_thresh
   # UPDATED: Use linewidth instead of size
   p <- ggplot(plot_df, aes(x = avg_log2FC, y = NegLogP)) + 
     geom_point(aes(color = Significant), alpha = 0.5, size = 1.5, na.rm = TRUE) + 
-    geom_vline(xintercept = c(-logfc_threshold, logfc_threshold), linetype = "dashed", color = "#95a5a6", alpha = 0.6, linewidth = 0.8) + 
+    geom_vline(xintercept = c(logfc_down, logfc_up), linetype = "dashed", color = "#95a5a6", alpha = 0.6, linewidth = 0.8) +
     geom_hline(yintercept = -log10(p_threshold), linetype = "dashed", color = "#95a5a6", alpha = 0.6, linewidth = 0.8) + 
     scale_color_manual(values = c("TRUE" = "#e74c3c", "FALSE" = "#bdc3c7"), guide = "none") + 
     geom_text_repel(aes(label = Label), max.overlaps = 20, box.padding = 0.5, na.rm = TRUE) + 
-    labs(title = paste0("Volcano Plot: ", dea_results$group1[1], " vs ", dea_results$group2[1]), subtitle = paste0(if(!is.null(highlight_gene) && highlight_gene != "") paste("Highlighted Gene:", highlight_gene) else "All Genes", "\n", filter_str), x = "Average Log2 Fold Change", y = "-log10(Adj. P-Value)") + 
+    labs(title = paste0("Volcano Plot: ", dea_results$group1[1], " vs ", dea_results$group2[1]), subtitle = paste0(if(!is.null(highlight_gene) && highlight_gene != "") paste("Highlighted Gene:", highlight_gene) else "All Genes", "\n", filter_str), x = "Log2 Fold Change", y = "-log10(Adj. P-Value)") +
     theme_minimal(base_size = 14) + theme(plot.title = element_text(face = "bold"))
   
   if (!is.null(highlight_gene) && highlight_gene != "") p <- p + geom_point(data = subset(plot_df, IsHighlight), color = "black", fill = "yellow", shape = 21, size = 5, stroke = 1.5, na.rm = TRUE)
@@ -892,7 +913,7 @@ build_expression_umap <- function(df, gene_name, expr, limits = NULL, raster_dpi
 #   { "introduction": "...", "dataset_information": "..." }
 # Search order: $ATLASLENS_LANDING_CONFIG, then landing_config.json in the
 # working directory, then app/landing_config.json. Returns NULL if none is found
-# or the file can't be parsed (the Introduction tab then shows curator guidance).
+# or the file can't be parsed (the Introduction tab then renders nothing).
 load_landing_config <- function() {
   override   <- Sys.getenv("ATLASLENS_LANDING_CONFIG", "")
   candidates <- c(if (nzchar(override)) override,
@@ -1178,7 +1199,7 @@ r_literal <- function(x) {
 # DEA: Wilcoxon (presto-accelerated) FindMarkers between two metadata groups.
 generate_dea_script <- function(comparison_meta, filter_list,
                                 highlight_gene = NULL,
-                                p_thr = 0.05, fc_thr = 0.585) {
+                                p_thr = 0.05, fc_down = -0.585, fc_up = 0.585) {
   groups <- comparison_meta$groups %||% comparison_meta$g1
   meta_col <- comparison_meta$col %||% ""
   g1 <- if (!is.null(comparison_meta$g1)) comparison_meta$g1 else groups[[1]]
@@ -1190,18 +1211,21 @@ generate_dea_script <- function(comparison_meta, filter_list,
     paste0("group1   <- ", r_literal(g1), "  # reference"),
     paste0("group2   <- ", r_literal(g2), "  # comparison"),
     paste0("p_thr    <- ", r_literal(p_thr)),
-    paste0("fc_thr   <- ", r_literal(fc_thr)),
+    paste0("fc_down  <- ", r_literal(fc_down), "  # down-regulated cutoff"),
+    paste0("fc_up    <- ", r_literal(fc_up),   "  # up-regulated cutoff"),
     "",
     "Seurat::Idents(seurat_obj) <- seurat_obj@meta.data[[meta_col]]",
     "seurat_obj <- Seurat::NormalizeData(seurat_obj, verbose = FALSE)",
     "markers <- Seurat::FindMarkers(seurat_obj,",
     "  ident.1 = group2, ident.2 = group1,",
     "  test.use = 'wilcox', use_presto = TRUE,",
-    "  logfc.threshold = fc_thr, min.pct = 0.1, verbose = FALSE,",
+    "  # logfc.threshold = 0 returns all tested genes; fc_down/fc_up are applied",
+    "  # below only to flag significance (matches the AtlasLens in-app behaviour).",
+    "  logfc.threshold = 0, min.pct = 0.1, verbose = FALSE,",
     "  assay = 'RNA', slot = 'data', recorrect_umi = FALSE)",
     "markers$gene <- rownames(markers)",
     "markers$Significant <- !is.na(markers$p_val_adj) & markers$p_val_adj < p_thr &",
-    "  !is.na(markers$avg_log2FC) & abs(markers$avg_log2FC) >= fc_thr",
+    "  !is.na(markers$avg_log2FC) & (markers$avg_log2FC <= fc_down | markers$avg_log2FC >= fc_up)",
     "",
     "write.csv(markers, 'atlaslens_dea_results.csv', row.names = FALSE)",
     paste0("message('Wrote ', nrow(markers), ' rows to atlaslens_dea_results.csv',",
@@ -1561,37 +1585,46 @@ custom_header <- tags$head(
     });
   "),
   tags$script(HTML("
-    // Lock the 'Show Plot' button in Dataset Exploration while the UMAP plots
-    // render, so a user cannot queue up multiple renders with rapid clicks.
-    // Disabling the button (disabled attr) is what actually blocks new Shiny
-    // input events; it is re-enabled only once both tracked plot outputs finish
-    // (shiny:recalculated) or error (shiny:error). A safety timeout guarantees
-    // the button can never get stuck disabled if a render is skipped via req().
+    // Lock a 'Show Plot' button in Dataset Exploration while its plots render.
+    // The button greys out the instant it is clicked - immediate feedback that
+    // the click registered - and the disabled attr blocks new Shiny input
+    // events so rapid clicks cannot queue up multiple 100k-cell renders. It
+    // re-enables once every tracked output finishes (shiny:recalculated) or
+    // errors (shiny:error). Two nets prevent a stuck button: a shiny:idle
+    // fallback for a click that triggers NO render at all (e.g. re-clicking the
+    // same genes, which the Coexpression server intentionally skips), and a
+    // 120s hard timeout if a render is skipped via req().
     (function() {
-      var tracked = ['explore_umap_meta', 'explore_umap_expr'];
-      var pending = 0, timer = null;
-      function btn() { return document.getElementById('show_umap_plot'); }
-      function enable() {
-        pending = 0;
-        if (timer) { clearTimeout(timer); timer = null; }
-        var b = btn();
-        if (b) { b.classList.remove('disabled'); b.removeAttribute('disabled'); }
-      }
-      $(document).on('click', '#show_umap_plot', function() {
-        var b = btn();
-        if (b) { b.classList.add('disabled'); b.setAttribute('disabled', 'disabled'); }
-        pending = tracked.length;
-        if (timer) clearTimeout(timer);
-        timer = setTimeout(enable, 120000);
-      });
-      function done(e) {
-        if (e.target && tracked.indexOf(e.target.id) !== -1 && pending > 0) {
-          pending--;
-          if (pending <= 0) enable();
+      function lockWhileRendering(buttonId, tracked) {
+        var pending = 0, sawRecalc = false, timer = null;
+        function btn() { return document.getElementById(buttonId); }
+        function isTracked(e) { return e.target && tracked.indexOf(e.target.id) !== -1; }
+        function enable() {
+          pending = 0; sawRecalc = false;
+          if (timer) { clearTimeout(timer); timer = null; }
+          var b = btn();
+          if (b) { b.classList.remove('disabled'); b.removeAttribute('disabled'); }
         }
+        $(document).on('click', '#' + buttonId, function() {
+          var b = btn();
+          if (b) { b.classList.add('disabled'); b.setAttribute('disabled', 'disabled'); }
+          pending = tracked.length; sawRecalc = false;
+          if (timer) clearTimeout(timer);
+          timer = setTimeout(enable, 120000);
+        });
+        $(document).on('shiny:recalculating', function(e) { if (isTracked(e)) sawRecalc = true; });
+        function done(e) {
+          if (isTracked(e) && pending > 0) { pending--; if (pending <= 0) enable(); }
+        }
+        $(document).on('shiny:recalculated', done);
+        $(document).on('shiny:error', done);
+        // Click that produced no tracked render: release once Shiny goes idle.
+        $(document).on('shiny:idle', function() {
+          if (pending > 0 && !sawRecalc) enable();
+        });
       }
-      $(document).on('shiny:recalculated', done);
-      $(document).on('shiny:error', done);
+      lockWhileRendering('show_umap_plot',  ['explore_umap_meta', 'explore_umap_expr']);
+      lockWhileRendering('show_coexp_plot', ['coexp_umap_g1', 'coexp_umap_g2']);
     })();
   ")),
   tags$style(HTML("
@@ -1726,10 +1759,10 @@ ui <- navbarPage(
              )
            ),
            
-           # Landing content, rendered from an optional landing_config.json the
-           # curator places in the app directory (manuscript §2: personalized
+           # Landing content, rendered from the landing_config.json the curator
+           # edits in the app directory (manuscript §2: personalized
            # "introduction" and "dataset information"). Loaded at startup by
-           # load_landing_config; a guidance panel shows here when absent.
+           # load_landing_config; nothing is shown here when it is absent or blank.
            fluidRow(
              column(12,
                     div(style = "max-width: 800px; margin: 20px auto; color: #555;",
@@ -1984,12 +2017,19 @@ ui <- navbarPage(
                                       info_icon("Genes with p_val_adj below this are flagged significant and highlighted in the results table. Type to override."),
                                       numericInput("dea_p_threshold", NULL,
                                                    value = 0.05, min = 0, max = 1, step = 0.001),
-                                      helpText("Enter a value between 0 and 1."),
-                                      tags$label("Log2FC threshold:", style = "font-weight: bold;"),
-                                      info_icon("Effect-size cutoff used together with the p-value cutoff."),
-                                      numericInput("dea_logfc_threshold", NULL,
-                                                   value = 0.585, min = 0, max = 10, step = 0.05),
-                                      helpText("Enter a value of 0 or greater."),
+                                      helpText("0.05 is the usual significance cutoff; 0.1 is sometimes used. Enter a value between 0 and 1."),
+                                      tags$label("Log2FC significance cutoffs:", style = "font-weight: bold;"),
+                                      info_icon("Two independent effect-size cutoffs. A gene is flagged significant (and coloured on the volcano) when its log2FC is at or below the Down cutoff OR at or above the Up cutoff, AND its adjusted p-value is below the threshold above. Every gene stays on the plot - the cutoffs only decide colouring. After a run the boxes' min/max snap to this comparison's actual log2FC range."),
+                                      fluidRow(
+                                        column(6, tags$label("Down (≤):", style = "font-weight: normal;"),
+                                               numericInput("dea_logfc_down", NULL,
+                                                            value = -0.585, max = 0, step = 0.05)),
+                                        column(6, tags$label("Up (≥):", style = "font-weight: normal;"),
+                                               numericInput("dea_logfc_up", NULL,
+                                                            value = 0.585, min = 0, step = 0.05))
+                                      ),
+                                      uiOutput("dea_logfc_range_hint"),
+                                      helpText("Down flags down-regulated genes (negative log2FC); Up flags up-regulated genes. Move a cutoff toward 0 to flag more genes."),
                                       sliderInput("dea_volcano_height", "Volcano plot height (px):",
                                                   min = 400, max = 1100, value = 650, step = 25),
                                       sliderInput("dea_violin_height", "Single-gene violin height (px):",
@@ -2292,10 +2332,10 @@ server <- function(input, output, session) {
     }
   })
   
-  # Landing-page descriptive content, populated from the optional JSON config the
-  # curator places in the app directory (loaded once by load_landing_config into
-  # vals$landing_config). When present we render introduction + dataset_information;
-  # otherwise a clearly-marked panel tells the curator how to add it.
+  # Landing-page descriptive content, populated from the landing_config.json the
+  # curator edits in the app directory (loaded once by load_landing_config into
+  # vals$landing_config). When the fields are filled we render introduction +
+  # dataset_information; when absent or blank we render nothing.
   output$landing_content <- renderUI({
     cfg <- vals$landing_config
     has_intro   <- !is.null(cfg) && !is.null(cfg$introduction)   && nzchar(cfg$introduction)
@@ -2312,16 +2352,11 @@ server <- function(input, output, session) {
                              p(cfg$dataset_information))
       )
     } else {
-      # No config found: tell the curator exactly how to add one.
-      div(style = "border: 1px dashed #b0b8c4; border-radius: 6px; padding: 18px 20px; background-color: #fafbfc;",
-          h3(icon("circle-info"), " Introduction & Dataset Information",
-             style = "border-bottom: 2px solid #667eea; padding-bottom: 10px; color: #2c3e50;"),
-          p(style = "color: #555; margin-bottom: 8px;",
-            "To show a custom introduction and dataset description here, place a ",
-            tags$code("landing_config.json"),
-            " file in the app directory. It is read automatically at startup."),
-          tags$pre(style = "background:#f4f6f8; border:1px solid #e1e5ea; border-radius:6px; padding:12px; font-size:12px; color:#2c3e50; white-space:pre-wrap;",
-                   "{\n  \"introduction\": \"Your introduction text...\",\n  \"dataset_information\": \"Cells, samples, processing, citation...\"\n}"))
+      # No description provided (no landing_config.json, or its fields are
+      # blank): render nothing so the Introduction tab stays clean. Curators add
+      # text by editing the landing_config.json template that ships in the app
+      # directory; it is read once at startup.
+      NULL
     }
   })
   
@@ -2503,7 +2538,7 @@ server <- function(input, output, session) {
   observeEvent(input$explore_add_filter, { col <- input$explore_filter_col_select; val <- input$explore_filter_vals_select; if(is.null(col) || is.null(val)) return(); curr <- vals$explore_metadata_filter; if (!is.list(curr)) curr <- list(); exist <- which(vapply(curr, function(x) x$col == col, logical(1))); if(length(exist)>0) curr[[exist]]$vals <- val else curr[[length(curr)+1]] <- list(col=col, vals=val); vals$explore_metadata_filter <- curr })
   observeEvent(input$explore_remove_filter, { idx <- as.numeric(input$explore_remove_filter); if(length(vals$explore_metadata_filter)>=idx) vals$explore_metadata_filter[[idx]] <- NULL })
   
-  output$explore_active_filters_ui <- renderUI({ if(length(vals$explore_metadata_filter)==0) return(NULL); div(class = "active-filters", lapply(seq_along(vals$explore_metadata_filter), function(i) { f <- vals$explore_metadata_filter[[i]]; span(span(class="filter-badge", strong(f$col), ": ", paste(head(f$vals, 2), collapse=","), if(length(f$vals)>2)"..."), actionLink("explore_remove_filter", "✕", onclick = paste0("Shiny.onInputChange('explore_remove_filter', ", i, ");"), style="color: red; margin-left: 5px;")) })) })
+  output$explore_active_filters_ui <- renderUI({ if(length(vals$explore_metadata_filter)==0) return(NULL); div(class = "active-filters", lapply(seq_along(vals$explore_metadata_filter), function(i) { f <- vals$explore_metadata_filter[[i]]; span(span(class="filter-badge", strong(f$col), ": ", paste(head(f$vals, 2), collapse=","), if(length(f$vals)>2)"..."), tags$a("✕", href = "#", onclick = paste0("Shiny.setInputValue('explore_remove_filter', ", i, ", {priority: 'event'}); return false;"), style="color: red; margin-left: 5px; text-decoration: none; cursor: pointer;")) })) })
   
   # Shared mask. Recomputes automatically whenever the filter list, the
   # Show/Hide Groups checkboxes, or the Color-by column change, so the
@@ -2776,7 +2811,11 @@ server <- function(input, output, session) {
     vals$ts_current_choices <- available_tps
     div(
       div(style = "margin-bottom: 5px; text-align: right;", actionLink("toggle_ts_tps", "Select / Deselect All")),
-      checkboxGroupInput("ts_selected_tps", NULL, choices = available_tps, selected = available_tps)
+      checkboxGroupInput("ts_selected_tps", NULL, choices = available_tps, selected = available_tps),
+      hr(),
+      # User-controlled number of k-means gene clusters for the heatmap.
+      sliderInput("ts_k_clusters", "Number of Biological Clusters:",
+                  min = 2, max = 10, value = 4, step = 1)
     )
   })
   
@@ -2911,17 +2950,17 @@ server <- function(input, output, session) {
     mean_mat <- mean_mat[!is.na(row_var) & row_var > 0, , drop = FALSE]
     if (nrow(mean_mat) < 2) return(NULL)
     
-    # The heatmap displays raw MEAN EXPRESSION per gene per timepoint (no
-    # z-scoring), so it has no negative values and matches the manuscript.
-    # Genes are still grouped by temporal SHAPE: a z-scored + L2-normalised
-    # copy is built purely as the k-means input (correlation-distance
-    # clustering), independent of absolute expression level.
+    # The heatmap displays RELATIVE (z-scored) expression per gene across
+    # timepoints, so each gene's temporal SHAPE is visible regardless of its
+    # absolute level. The same z-scored matrix, additionally L2-normalised per
+    # row, is the k-means input (correlation-distance clustering on shape).
     if (ncol(mean_mat) >= 2) {
       clust_mat <- t(scale(t(mean_mat)))
       clust_mat[is.na(clust_mat)] <- 0
-      # Number of gene clusters tracks the number of timepoints, so the
-      # cluster count reflects the time-course design, not the gene count.
-      k <- min(ncol(mean_mat), max(2, floor(nrow(mean_mat) / 2)))
+      # Number of gene clusters is user-controlled via the sidebar slider
+      # (default 4), clamped to the number of distinct trajectories so kmeans
+      # never receives more centres than data points.
+      k <- min(input$ts_k_clusters %||% 4, nrow(unique(clust_mat)))
       row_norms <- sqrt(rowSums(clust_mat^2))
       row_norms[row_norms == 0] <- 1
       km_input  <- clust_mat / row_norms
@@ -2933,8 +2972,11 @@ server <- function(input, output, session) {
       km_clusters <- rep(1, nrow(mean_mat))
       names(km_clusters) <- rownames(mean_mat)
     }
-    fill_label   <- "Mean\nexpression"
-    caption_str  <- "Mean expression per gene at each timepoint; genes grouped by temporal pattern (k-means)."
+    # Show relative (z-scored) expression so the heatmap reflects temporal
+    # SHAPE rather than absolute level; diverging scale centred at 0.
+    fill_label   <- "Z-score\n(Relative)"
+    caption_str  <- "Relative expression (Z-score) per gene at each timepoint; genes grouped by temporal pattern (k-means)."
+    midpoint_val <- 0
     
     # Per-cluster stats: `amplitude` (largest mean-expression swing across
     # timepoints) ranks how dynamic a cluster is; `peak_tp` is the timepoint
@@ -2963,7 +3005,15 @@ server <- function(input, output, session) {
     gene_order    <- order(km_clusters)
     ordered_genes <- rownames(mean_mat)[gene_order]
     
-    plot_mat  <- mean_mat[ordered_genes, , drop = FALSE]
+    # Plot the z-scored trajectories (clust_mat); fall back to raw mean for a
+    # single-timepoint slice where z-scoring is undefined.
+    if (ncol(mean_mat) >= 2) {
+      plot_mat <- clust_mat[ordered_genes, , drop = FALSE]
+    } else {
+      plot_mat     <- mean_mat[ordered_genes, , drop = FALSE]
+      midpoint_val <- mean(mean_mat, na.rm = TRUE)
+      fill_label   <- "Mean\nexpression"
+    }
     # Map each gene to its cluster label so the heatmap can be split into
     # labelled per-cluster bands showing which timepoint each cluster peaks at.
     gene_label <- stats::setNames(
@@ -2994,7 +3044,8 @@ server <- function(input, output, session) {
     p <- if (n_rows <= 30) p + geom_tile(color = "white", linewidth = 0.3)
     else                   p + geom_raster()
     p <- p +
-      scale_fill_expression(name = fill_label) +
+      scale_fill_gradient2(low = "#2166ac", mid = "#f7f7f7", high = "#e08214",
+                           midpoint = midpoint_val, name = fill_label) +
       labs(title = title_str,
            subtitle = paste("Condition:", vals$ts_active_condition,
                             "| Cell type:", vals$ts_active_celltype),
@@ -3513,12 +3564,17 @@ server <- function(input, output, session) {
     # Subset global DF (FAST)
     umap_df <- if (!is.null(snap$mask)) vals$global_plot_data[snap$mask, ] else vals$global_plot_data
 
-    # Force explicit factor conversion
-    group_data <- umap_df[[snap$meta_col]]
-    umap_df$group <- as.factor(group_data)
+    # droplevels() so only the cell types actually present in the current
+    # (filtered) view are coloured. A metadata factor copied from meta.data
+    # keeps every original level; without dropping, the palette is sized/shifted
+    # against levels that aren't plotted and stops matching the legend below.
+    group_data <- droplevels(as.factor(umap_df[[snap$meta_col]]))
+    umap_df$group <- group_data
 
-    n_groups <- length(unique(umap_df$group))
-    my_palette <- get_expanded_palette(n_groups)
+    groups <- levels(group_data)
+    # Named palette keyed by level so the plot, the CSS legend below, and the
+    # PNG export all map a given category to the exact same colour.
+    my_palette <- setNames(get_expanded_palette(length(groups)), groups)
 
     # The in-plot legend is suppressed here: with many cell-type levels it
     # used to overflow the image border or shrink the plotting panel to an
@@ -3554,13 +3610,15 @@ server <- function(input, output, session) {
     req(vals$global_plot_data, snap$meta_col)
     umap_df <- if (!is.null(snap$mask)) vals$global_plot_data[snap$mask, ] else vals$global_plot_data
     if (is.null(umap_df[[snap$meta_col]])) return(NULL)
-    # Use levels(as.factor(...)) so the chip order matches the plot's
-    # internal factor levels byte-for-byte - same locale, same NA handling.
-    group_factor <- as.factor(umap_df[[snap$meta_col]])
+    # droplevels(as.factor(...)) so the legend lists ONLY the categories present
+    # in the current filtered view, in the same level order the plot uses. The
+    # named palette (identical recipe to the plot) guarantees each chip colour
+    # matches its points exactly.
+    group_factor <- droplevels(as.factor(umap_df[[snap$meta_col]]))
     groups <- levels(group_factor)
     n_groups <- length(groups)
     if (n_groups == 0) return(NULL)
-    palette <- get_expanded_palette(n_groups)
+    palette <- setNames(get_expanded_palette(n_groups), groups)
     chips <- lapply(seq_along(groups), function(i) {
       div(style = "display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: #ffffff; border: 1px solid #e1e5ea; border-radius: 6px; min-height: 36px;",
           div(style = sprintf(
@@ -3685,9 +3743,9 @@ server <- function(input, output, session) {
     content  = function(file) {
       req(vals$global_plot_data, input$explore_filter_meta_col)
       umap_df <- if (!is.null(vals$explore_mask)) vals$global_plot_data[vals$explore_mask, ] else vals$global_plot_data
-      umap_df$group <- as.factor(umap_df[[input$explore_filter_meta_col]])
+      umap_df$group <- droplevels(as.factor(umap_df[[input$explore_filter_meta_col]]))
       n_groups <- length(levels(umap_df$group))
-      pal <- get_expanded_palette(n_groups)
+      pal <- setNames(get_expanded_palette(n_groups), levels(umap_df$group))
       # Pick a legend column count so the legend tiles into rows-of-N rather
       # than one giant single column. Numbers tuned for the wide export
       # canvas below.
@@ -3983,7 +4041,7 @@ server <- function(input, output, session) {
   output$filter_vals_select_ui <- renderUI({ req(input$filter_col_select, vals$data); selectInput("filter_vals_select", NULL, choices = sort(unique(as.character(vals$data@meta.data[[input$filter_col_select]]))), multiple = TRUE, width = "100%") })
   observeEvent(input$add_filter, { col <- input$filter_col_select; val <- input$filter_vals_select; if(is.null(col) || is.null(val)) return(); curr <- vals$active_filters; exist <- which(vapply(curr, function(x) x$col == col, logical(1))); if(length(exist)>0) curr[[exist]]$vals <- val else curr[[length(curr)+1]] <- list(col=col, vals=val); vals$active_filters <- curr })
   observeEvent(input$remove_filter, { idx <- as.numeric(input$remove_filter); if(length(vals$active_filters)>=idx) vals$active_filters[[idx]] <- NULL })
-  output$active_filters_ui <- renderUI({ if(length(vals$active_filters)==0) return(NULL); div(class = "active-filters", lapply(seq_along(vals$active_filters), function(i) { f <- vals$active_filters[[i]]; span(span(class="filter-badge", strong(f$col), ": ", paste(head(f$vals, 2), collapse=","), if(length(f$vals)>2)"..."), actionLink("remove_filter", "✕", onclick = paste0("Shiny.onInputChange('remove_filter', ", i, ");"), style="color: red; margin-left: 5px;")) })) })
+  output$active_filters_ui <- renderUI({ if(length(vals$active_filters)==0) return(NULL); div(class = "active-filters", lapply(seq_along(vals$active_filters), function(i) { f <- vals$active_filters[[i]]; span(span(class="filter-badge", strong(f$col), ": ", paste(head(f$vals, 2), collapse=","), if(length(f$vals)>2)"..."), tags$a("✕", href = "#", onclick = paste0("Shiny.setInputValue('remove_filter', ", i, ", {priority: 'event'}); return false;"), style="color: red; margin-left: 5px; text-decoration: none; cursor: pointer;")) })) })
   output$analysis_groups_ui <- renderUI({ req(vals$data, input$analysis_meta_col); obj <- vals$data; keep_cells <- rep(TRUE, ncol(obj)); for(f in vals$active_filters) { keep_cells <- keep_cells & (obj@meta.data[[f$col]] %in% f$vals) }; if (sum(keep_cells) > 0) { available_groups <- sort(unique(as.character(obj@meta.data[[input$analysis_meta_col]][keep_cells]))) } else { available_groups <- character(0) }; current_sel <- isolate(input$analysis_groups); selected_groups <- intersect(current_sel, available_groups); if (!is.null(vals$cocoa_history_pending)) { if (all(vals$cocoa_history_pending %in% available_groups)) { selected_groups <- vals$cocoa_history_pending; vals$cocoa_history_pending <- NULL } else if (length(intersect(vals$cocoa_history_pending, available_groups)) > 0) { selected_groups <- intersect(vals$cocoa_history_pending, available_groups); vals$cocoa_history_pending <- NULL } else { vals$cocoa_history_pending <- NULL } }; vals$analysis_current_choices <- available_groups; div(div(style = "margin-bottom: 5px; text-align: right;", actionLink("toggle_analysis_groups", "Select / Deselect All")), checkboxGroupInput("analysis_groups", NULL, choices = available_groups, selected = selected_groups)) })
   
   observeEvent(input$toggle_analysis_groups, {
@@ -4365,7 +4423,7 @@ server <- function(input, output, session) {
   output$dea_filter_vals_select_ui <- renderUI({ req(input$dea_filter_col_select, vals$data); selectInput("dea_filter_vals_select", NULL, choices = sort(unique(as.character(vals$data@meta.data[[input$dea_filter_col_select]]))), multiple = TRUE, width = "100%") })
   observeEvent(input$dea_add_filter, { col <- input$dea_filter_col_select; val <- input$dea_filter_vals_select; if(is.null(col) || is.null(val)) return(); curr <- vals$dea_filter_list; exist <- which(vapply(curr, function(x) x$col == col, logical(1))); if(length(exist)>0) curr[[exist]]$vals <- val else curr[[length(curr)+1]] <- list(col=col, vals=val); vals$dea_filter_list <- curr })
   observeEvent(input$dea_remove_filter, { idx <- as.numeric(input$dea_remove_filter); if(length(vals$dea_filter_list)>=idx) vals$dea_filter_list[[idx]] <- NULL })
-  output$dea_active_filters_ui <- renderUI({ if(length(vals$dea_filter_list)==0) return(NULL); div(class = "active-filters", lapply(seq_along(vals$dea_filter_list), function(i) { f <- vals$dea_filter_list[[i]]; span(span(class="filter-badge", strong(f$col), ": ", paste(head(f$vals, 2), collapse=","), if(length(f$vals)>2)"..."), actionLink("dea_remove_filter", "✕", onclick = paste0("Shiny.onInputChange('dea_remove_filter', ", i, ");"), style="color: red; margin-left: 5px;")) })) })
+  output$dea_active_filters_ui <- renderUI({ if(length(vals$dea_filter_list)==0) return(NULL); div(class = "active-filters", lapply(seq_along(vals$dea_filter_list), function(i) { f <- vals$dea_filter_list[[i]]; span(span(class="filter-badge", strong(f$col), ": ", paste(head(f$vals, 2), collapse=","), if(length(f$vals)>2)"..."), tags$a("✕", href = "#", onclick = paste0("Shiny.setInputValue('dea_remove_filter', ", i, ", {priority: 'event'}); return false;"), style="color: red; margin-left: 5px; text-decoration: none; cursor: pointer;")) })) })
   output$dea_cell_count_ui <- renderUI({ req(vals$data, input$dea_meta_col, input$dea_group1, input$dea_group2); obj <- vals$data; mask1 <- obj@meta.data[[input$dea_meta_col]] == input$dea_group1; mask2 <- obj@meta.data[[input$dea_meta_col]] == input$dea_group2; for(f in vals$dea_filter_list) { mask1 <- mask1 & (obj@meta.data[[f$col]] %in% f$vals); mask2 <- mask2 & (obj@meta.data[[f$col]] %in% f$vals) }; div(class = "cell-count-box", p(icon("users"), " Group 1: ", format(sum(mask1), big.mark = ",")), p(icon("users"), " Group 2: ", format(sum(mask2), big.mark = ",")), p(strong("Total: "), format(sum(mask1)+sum(mask2), big.mark = ","))) })
   output$dea_run_btn_ui <- renderUI({ 
     if (is.null(input$dea_group1) || is.null(input$dea_group2) || input$dea_group1 == input$dea_group2) {
@@ -4400,7 +4458,7 @@ server <- function(input, output, session) {
     
     
     shinyjs::show("dea_loading_overlay"); session$sendCustomMessage("start_timer", list(id = "dea_timer"))
-    vals$dea_results <- NULL; vals$dea_error_msg <- NULL; vals$dea_is_analyzing <- TRUE
+    vals$dea_results <- NULL; vals$dea_error_msg <- NULL; vals$dea_is_analyzing <- TRUE; vals$dea_logfc_range <- NULL
     
     # === v157 approach: extract sparse matrix + meta on main thread ===
     # Only the small subset gets serialized to the worker, NOT the full Seurat object.
@@ -4411,7 +4469,7 @@ server <- function(input, output, session) {
     future({
       run_dea_worker(subset_counts, subset_meta, meta_col, group1, group2) 
     }, globals=list(run_dea_worker=run_dea_worker, subset_counts=subset_counts, subset_meta=subset_meta, group1=group1, group2=group2, meta_col=meta_col), packages = c("Seurat", "presto", "Matrix"), seed = TRUE) %...>% (function(res) {
-      if (!is.null(res) && nrow(res) > 0) { vals$dea_results <- res; vals$dea_filters_used <- filters; vals$dea_meta_used <- list(col=meta_col, g1=group1, g2=group2); save_dea_cache(hash_in, res, filters, list(col=meta_col, groups=c(group1, group2)), gene_in) } else { vals$dea_error_msg <- "No results returned." }
+      if (!is.null(res) && nrow(res) > 0) { vals$dea_results <- res; vals$dea_filters_used <- filters; vals$dea_meta_used <- list(col=meta_col, g1=group1, g2=group2); rng <- range(res$avg_log2FC, na.rm = TRUE); lo <- min(floor(rng[1] * 100) / 100, 0); hi <- max(ceiling(rng[2] * 100) / 100, 0); vals$dea_logfc_range <- c(lo, hi); updateNumericInput(session, "dea_logfc_down", min = lo, max = 0); updateNumericInput(session, "dea_logfc_up", min = 0, max = hi); save_dea_cache(hash_in, res, filters, list(col=meta_col, groups=c(group1, group2)), gene_in) } else { vals$dea_error_msg <- "No results returned." }
     }) %...!% (function(err) { vals$dea_error_msg <- paste("Async Error:", err$message) }) %>% finally(function() {
       vals$dea_is_analyzing <- FALSE; session$sendCustomMessage("stop_timer", list()); shinyjs::hide("dea_loading_overlay")
     })
@@ -4554,14 +4612,24 @@ server <- function(input, output, session) {
       )
     )
   })
+  # Range hint under the cutoff boxes: before any run, restate the defaults;
+  # after a run, show this comparison's actual log2FC span (= the box bounds).
+  output$dea_logfc_range_hint <- renderUI({
+    rng <- vals$dea_logfc_range
+    if (is.null(rng)) {
+      helpText("Defaults: Down -0.585, Up +0.585. After a run the bounds snap to this comparison's log2FC range.")
+    } else {
+      helpText(sprintf("This comparison's log2FC spans %.2f to %.2f; the cutoff boxes are bounded to that range.", rng[1], rng[2]))
+    }
+  })
   output$dea_volcano_plot <- renderPlot({
     fr <- dea_filtered_results()
     req(fr)
     validate(need(nrow(fr) > 0,
                   "None of the uploaded genes match the DEA results. Clear the upload or run DEA on a comparison that includes these genes."))
     create_dea_volcano_plot(fr, input$dea_gene, input$dea_p_threshold,
-                            input$dea_logfc_threshold, vals$dea_filters_used,
-                            input$dea_show_significant)
+                            input$dea_logfc_down, input$dea_logfc_up,
+                            vals$dea_filters_used, input$dea_show_significant)
   }, height = 600)
   output$dea_violin_title <- renderText({ if(is.null(input$dea_gene) || input$dea_gene == "") "Select a gene to view expression" else paste("Expression of", input$dea_gene) })
   output$dea_violin_plot <- renderPlot({ req(vals$dea_results, input$dea_gene, vals$data, vals$dea_meta_used); create_gene_violin_plot(vals$data, input$dea_gene, vals$dea_meta_used$col, vals$dea_meta_used$g1, vals$dea_meta_used$g2, vals$dea_filters_used) }, height = function() input$dea_violin_height %||% 500)
@@ -4570,12 +4638,13 @@ server <- function(input, output, session) {
     req(fr)
     validate(need(nrow(fr) > 0,
                   "None of the uploaded genes match the DEA results."))
-    p_thr  <- input$dea_p_threshold     %||% 0.05
-    fc_thr <- input$dea_logfc_threshold %||% 0.585
+    p_thr   <- input$dea_p_threshold %||% 0.05
+    fc_down <- input$dea_logfc_down  %||% -0.585
+    fc_up   <- input$dea_logfc_up    %||% 0.585
     raw <- fr
     if (isTRUE(input$dea_show_significant)) {
       sig_mask <- !is.na(raw$p_val_adj) & raw$p_val_adj < p_thr &
-        !is.na(raw$avg_log2FC) & abs(raw$avg_log2FC) >= fc_thr
+        !is.na(raw$avg_log2FC) & (raw$avg_log2FC <= fc_down | raw$avg_log2FC >= fc_up)
       raw <- raw[sig_mask, , drop = FALSE]
     }
     raw <- raw[order(raw$p_val_adj, na.last = TRUE), , drop = FALSE]
@@ -4587,7 +4656,7 @@ server <- function(input, output, session) {
       pct.1      = round(raw$pct.1, 3),
       pct.2      = round(raw$pct.2, 3),
       Significant = ifelse(!is.na(raw$p_val_adj) & raw$p_val_adj < p_thr &
-                             !is.na(raw$avg_log2FC) & abs(raw$avg_log2FC) >= fc_thr,
+                             !is.na(raw$avg_log2FC) & (raw$avg_log2FC <= fc_down | raw$avg_log2FC >= fc_up),
                            "Yes", ""),
       stringsAsFactors = FALSE
     )
@@ -4597,8 +4666,8 @@ server <- function(input, output, session) {
       rownames = FALSE,
       caption  = tags$caption(
         style = "caption-side: top; text-align: left; color: #2c3e50; font-weight: bold;",
-        sprintf("Rows marked 'Yes' in Significant: p_val_adj < %.3g and |log2FC| >= %.3g.",
-                p_thr, fc_thr))
+        sprintf("Rows marked 'Yes' in Significant: p_val_adj < %.3g and (log2FC <= %.3g or log2FC >= %.3g).",
+                p_thr, fc_down, fc_up))
     )
     DT::formatStyle(dt, "Significant",
                     backgroundColor = DT::styleEqual("Yes", "#e8f5e9"),
@@ -4613,7 +4682,7 @@ server <- function(input, output, session) {
       fr <- dea_filtered_results()
       ggsave(file,
              create_dea_volcano_plot(fr, input$dea_gene, input$dea_p_threshold,
-                                     input$dea_logfc_threshold,
+                                     input$dea_logfc_down, input$dea_logfc_up,
                                      show_significant = input$dea_show_significant),
              width = 12, height = 7)
     }
@@ -4634,8 +4703,9 @@ server <- function(input, output, session) {
         comparison_meta = vals$dea_meta_used %||% list(),
         filter_list     = vals$dea_filters_used %||% list(),
         highlight_gene  = input$dea_gene,
-        p_thr  = input$dea_p_threshold %||% 0.05,
-        fc_thr = input$dea_logfc_threshold %||% 0.585
+        p_thr   = input$dea_p_threshold %||% 0.05,
+        fc_down = input$dea_logfc_down  %||% -0.585,
+        fc_up   = input$dea_logfc_up    %||% 0.585
       ), file)
     }
   )
@@ -4647,7 +4717,10 @@ server <- function(input, output, session) {
   # Status indicator showing whether DEA results are available
   output$go_dea_status_ui <- renderUI({
     if (!is.null(vals$dea_results) && nrow(vals$dea_results) > 0) {
-      n_sig <- sum(vals$dea_results$p_val_adj < 0.05 & abs(vals$dea_results$avg_log2FC) >= 0.585, na.rm = TRUE)
+      p_thr   <- input$dea_p_threshold %||% 0.05
+      fc_down <- input$dea_logfc_down  %||% -0.585
+      fc_up   <- input$dea_logfc_up    %||% 0.585
+      n_sig <- sum(vals$dea_results$p_val_adj < p_thr & (vals$dea_results$avg_log2FC <= fc_down | vals$dea_results$avg_log2FC >= fc_up), na.rm = TRUE)
       div(style = "color: #27ae60; font-weight: bold;", icon("check-circle"),
           paste0(" DEA results ready (", nrow(vals$dea_results), " genes, ", n_sig, " significant)"))
     } else {
@@ -4878,7 +4951,7 @@ server <- function(input, output, session) {
         tabPanel("Dot Plot", icon = icon("braille"), br(),
                  wellPanel(style = "background-color: #f8f9fa; padding: 15px;",
                            h4("GO Enrichment Dot Plot"),
-                           p("Top enriched GO terms. GeneRatio on the x-axis; dot size = gene count, colour = adjusted p-value."),
+                           p("Top enriched GO terms. GeneRatio on the x-axis; dot size = gene count, colour = -log10(adjusted p-value) (brighter = more significant)."),
                            withSpinner(plotOutput("go_dotplot", height = "650px"), type = 6, color = "#8e44ad")
                  ),
                  div(style = "margin-top: 15px;",
@@ -5100,6 +5173,7 @@ server <- function(input, output, session) {
           
           updateSelectInput(session, "dea_meta_col", selected = cache_data$comparison_meta$col)
           vals$dea_filter_list <- cache_data$filter_list; vals$dea_filters_used <- cache_data$filter_list; vals$dea_meta_used <- list(col=cache_data$comparison_meta$col, g1=cache_data$comparison_meta$groups[1], g2=cache_data$comparison_meta$groups[2]); vals$dea_results <- cache_data$results
+          if (!is.null(cache_data$results) && nrow(cache_data$results) > 0) { rng <- range(cache_data$results$avg_log2FC, na.rm = TRUE); lo <- min(floor(rng[1] * 100) / 100, 0); hi <- max(ceiling(rng[2] * 100) / 100, 0); vals$dea_logfc_range <- c(lo, hi); updateNumericInput(session, "dea_logfc_down", min = lo, max = 0); updateNumericInput(session, "dea_logfc_up", min = 0, max = hi) }
           updateNavbarPage(session, "main_nav", selected = "DEA")
         }
         showNotification("Restored from history!", type = "message")
