@@ -829,20 +829,14 @@ placeholder_plot <- function(msg = "Click \"Show Plot\" to render this view.") {
     theme_void()
 }
 
-create_dea_volcano_plot <- function(dea_results, highlight_gene = NULL, p_threshold = 0.05, logfc_down = -0.585, logfc_up = 0.585, filter_list = NULL, show_significant = FALSE) {
+create_dea_volcano_plot <- function(dea_results, highlight_gene = NULL, p_threshold = 0.05, logfc_threshold = 0.25, filter_list = NULL, show_significant = FALSE) {
   if (is.null(dea_results) || nrow(dea_results) == 0) return(NULL)
-  # Two independent effect-size cutoffs (down/up). A gene is "significant" when
-  # its p_val_adj clears the threshold AND its log2FC sits beyond one of the two
-  # vertical lines (<= down OR >= up). All genes stay plotted; the cutoffs only
-  # colour points. Guard against blank/NA boxes so the plot never errors out.
-  if (is.null(logfc_down) || is.na(logfc_down)) logfc_down <- -0.585
-  if (is.null(logfc_up)   || is.na(logfc_up))   logfc_up   <- 0.585
 
   if (show_significant) {
-    dea_results <- dea_results %>% filter(p_val_adj < p_threshold & (avg_log2FC <= logfc_down | avg_log2FC >= logfc_up))
+    dea_results <- dea_results %>% filter(p_val_adj < p_threshold & abs(avg_log2FC) > logfc_threshold)
   }
 
-  plot_df <- dea_results %>% mutate(NegLogP = -log10(p_val_adj), NegLogP = ifelse(is.infinite(NegLogP), 300, NegLogP), Significant = p_val_adj < p_threshold & (avg_log2FC <= logfc_down | avg_log2FC >= logfc_up), IsHighlight = if (!is.null(highlight_gene) && highlight_gene != "") gene == highlight_gene else FALSE) %>% arrange(IsHighlight)
+  plot_df <- dea_results %>% mutate(NegLogP = -log10(p_val_adj), NegLogP = ifelse(is.infinite(NegLogP), 300, NegLogP), Significant = p_val_adj < p_threshold & abs(avg_log2FC) > logfc_threshold, IsHighlight = if (!is.null(highlight_gene) && highlight_gene != "") gene == highlight_gene else FALSE) %>% arrange(IsHighlight)
   # Label the 10 most relevant genes, not just the first 10 rows: sort by
   # adjusted p-value, breaking ties by larger absolute fold change. Done on a
   # copy so plot_df keeps its IsHighlight draw order (highlighted point on top).
@@ -855,7 +849,7 @@ create_dea_volcano_plot <- function(dea_results, highlight_gene = NULL, p_thresh
   # UPDATED: Use linewidth instead of size
   p <- ggplot(plot_df, aes(x = avg_log2FC, y = NegLogP)) + 
     geom_point(aes(color = Significant), alpha = 0.5, size = 1.5, na.rm = TRUE) + 
-    geom_vline(xintercept = c(logfc_down, logfc_up), linetype = "dashed", color = "#95a5a6", alpha = 0.6, linewidth = 0.8) +
+    geom_vline(xintercept = c(-logfc_threshold, logfc_threshold), linetype = "dashed", color = "#95a5a6", alpha = 0.6, linewidth = 0.8) +
     geom_hline(yintercept = -log10(p_threshold), linetype = "dashed", color = "#95a5a6", alpha = 0.6, linewidth = 0.8) + 
     scale_color_manual(values = c("TRUE" = "#e74c3c", "FALSE" = "#bdc3c7"), guide = "none") + 
     geom_text_repel(aes(label = Label), max.overlaps = 20, box.padding = 0.5, na.rm = TRUE) + 
@@ -1199,7 +1193,7 @@ r_literal <- function(x) {
 # DEA: Wilcoxon (presto-accelerated) FindMarkers between two metadata groups.
 generate_dea_script <- function(comparison_meta, filter_list,
                                 highlight_gene = NULL,
-                                p_thr = 0.05, fc_down = -0.585, fc_up = 0.585) {
+                                p_thr = 0.05, fc_thr = 0.585) {
   groups <- comparison_meta$groups %||% comparison_meta$g1
   meta_col <- comparison_meta$col %||% ""
   g1 <- if (!is.null(comparison_meta$g1)) comparison_meta$g1 else groups[[1]]
@@ -1211,21 +1205,20 @@ generate_dea_script <- function(comparison_meta, filter_list,
     paste0("group1   <- ", r_literal(g1), "  # reference"),
     paste0("group2   <- ", r_literal(g2), "  # comparison"),
     paste0("p_thr    <- ", r_literal(p_thr)),
-    paste0("fc_down  <- ", r_literal(fc_down), "  # down-regulated cutoff"),
-    paste0("fc_up    <- ", r_literal(fc_up),   "  # up-regulated cutoff"),
+    paste0("fc_thr   <- ", r_literal(fc_thr)),
     "",
     "Seurat::Idents(seurat_obj) <- seurat_obj@meta.data[[meta_col]]",
     "seurat_obj <- Seurat::NormalizeData(seurat_obj, verbose = FALSE)",
     "markers <- Seurat::FindMarkers(seurat_obj,",
     "  ident.1 = group2, ident.2 = group1,",
     "  test.use = 'wilcox', use_presto = TRUE,",
-    "  # logfc.threshold = 0 returns all tested genes; fc_down/fc_up are applied",
-    "  # below only to flag significance (matches the AtlasLens in-app behaviour).",
+    "  # logfc.threshold = 0 returns all tested genes; fc_thr is applied below",
+    "  # only to flag significance (matches the AtlasLens in-app behaviour).",
     "  logfc.threshold = 0, min.pct = 0.1, verbose = FALSE,",
     "  assay = 'RNA', slot = 'data', recorrect_umi = FALSE)",
     "markers$gene <- rownames(markers)",
     "markers$Significant <- !is.na(markers$p_val_adj) & markers$p_val_adj < p_thr &",
-    "  !is.na(markers$avg_log2FC) & (markers$avg_log2FC <= fc_down | markers$avg_log2FC >= fc_up)",
+    "  !is.na(markers$avg_log2FC) & abs(markers$avg_log2FC) >= fc_thr",
     "",
     "write.csv(markers, 'atlaslens_dea_results.csv', row.names = FALSE)",
     paste0("message('Wrote ', nrow(markers), ' rows to atlaslens_dea_results.csv',",
@@ -2018,18 +2011,11 @@ ui <- navbarPage(
                                       numericInput("dea_p_threshold", NULL,
                                                    value = 0.05, min = 0, max = 1, step = 0.001),
                                       helpText("0.05 is the usual significance cutoff; 0.1 is sometimes used. Enter a value between 0 and 1."),
-                                      tags$label("Log2FC significance cutoffs:", style = "font-weight: bold;"),
-                                      info_icon("Two independent effect-size cutoffs. A gene is flagged significant (and coloured on the volcano) when its log2FC is at or below the Down cutoff OR at or above the Up cutoff, AND its adjusted p-value is below the threshold above. Every gene stays on the plot - the cutoffs only decide colouring. After a run the boxes' min/max snap to this comparison's actual log2FC range."),
-                                      fluidRow(
-                                        column(6, tags$label("Down (≤):", style = "font-weight: normal;"),
-                                               numericInput("dea_logfc_down", NULL,
-                                                            value = -0.585, max = 0, step = 0.05)),
-                                        column(6, tags$label("Up (≥):", style = "font-weight: normal;"),
-                                               numericInput("dea_logfc_up", NULL,
-                                                            value = 0.585, min = 0, step = 0.05))
-                                      ),
-                                      uiOutput("dea_logfc_range_hint"),
-                                      helpText("Down flags down-regulated genes (negative log2FC); Up flags up-regulated genes. Move a cutoff toward 0 to flag more genes."),
+                                      tags$label("Log2FC threshold:", style = "font-weight: bold;"),
+                                      info_icon("Effect-size cutoff used together with the p-value cutoff."),
+                                      numericInput("dea_logfc_threshold", NULL,
+                                                   value = 0.585, min = 0, max = 10, step = 0.05),
+                                      helpText("Enter a value of 0 or greater."),
                                       sliderInput("dea_volcano_height", "Volcano plot height (px):",
                                                   min = 400, max = 1100, value = 650, step = 25),
                                       sliderInput("dea_violin_height", "Single-gene violin height (px):",
@@ -4458,7 +4444,7 @@ server <- function(input, output, session) {
     
     
     shinyjs::show("dea_loading_overlay"); session$sendCustomMessage("start_timer", list(id = "dea_timer"))
-    vals$dea_results <- NULL; vals$dea_error_msg <- NULL; vals$dea_is_analyzing <- TRUE; vals$dea_logfc_range <- NULL
+    vals$dea_results <- NULL; vals$dea_error_msg <- NULL; vals$dea_is_analyzing <- TRUE
     
     # === v157 approach: extract sparse matrix + meta on main thread ===
     # Only the small subset gets serialized to the worker, NOT the full Seurat object.
@@ -4469,7 +4455,7 @@ server <- function(input, output, session) {
     future({
       run_dea_worker(subset_counts, subset_meta, meta_col, group1, group2) 
     }, globals=list(run_dea_worker=run_dea_worker, subset_counts=subset_counts, subset_meta=subset_meta, group1=group1, group2=group2, meta_col=meta_col), packages = c("Seurat", "presto", "Matrix"), seed = TRUE) %...>% (function(res) {
-      if (!is.null(res) && nrow(res) > 0) { vals$dea_results <- res; vals$dea_filters_used <- filters; vals$dea_meta_used <- list(col=meta_col, g1=group1, g2=group2); rng <- range(res$avg_log2FC, na.rm = TRUE); lo <- min(floor(rng[1] * 100) / 100, 0); hi <- max(ceiling(rng[2] * 100) / 100, 0); vals$dea_logfc_range <- c(lo, hi); updateNumericInput(session, "dea_logfc_down", min = lo, max = 0); updateNumericInput(session, "dea_logfc_up", min = 0, max = hi); save_dea_cache(hash_in, res, filters, list(col=meta_col, groups=c(group1, group2)), gene_in) } else { vals$dea_error_msg <- "No results returned." }
+      if (!is.null(res) && nrow(res) > 0) { vals$dea_results <- res; vals$dea_filters_used <- filters; vals$dea_meta_used <- list(col=meta_col, g1=group1, g2=group2); save_dea_cache(hash_in, res, filters, list(col=meta_col, groups=c(group1, group2)), gene_in) } else { vals$dea_error_msg <- "No results returned." }
     }) %...!% (function(err) { vals$dea_error_msg <- paste("Async Error:", err$message) }) %>% finally(function() {
       vals$dea_is_analyzing <- FALSE; session$sendCustomMessage("stop_timer", list()); shinyjs::hide("dea_loading_overlay")
     })
@@ -4612,24 +4598,14 @@ server <- function(input, output, session) {
       )
     )
   })
-  # Range hint under the cutoff boxes: before any run, restate the defaults;
-  # after a run, show this comparison's actual log2FC span (= the box bounds).
-  output$dea_logfc_range_hint <- renderUI({
-    rng <- vals$dea_logfc_range
-    if (is.null(rng)) {
-      helpText("Defaults: Down -0.585, Up +0.585. After a run the bounds snap to this comparison's log2FC range.")
-    } else {
-      helpText(sprintf("This comparison's log2FC spans %.2f to %.2f; the cutoff boxes are bounded to that range.", rng[1], rng[2]))
-    }
-  })
   output$dea_volcano_plot <- renderPlot({
     fr <- dea_filtered_results()
     req(fr)
     validate(need(nrow(fr) > 0,
                   "None of the uploaded genes match the DEA results. Clear the upload or run DEA on a comparison that includes these genes."))
     create_dea_volcano_plot(fr, input$dea_gene, input$dea_p_threshold,
-                            input$dea_logfc_down, input$dea_logfc_up,
-                            vals$dea_filters_used, input$dea_show_significant)
+                            input$dea_logfc_threshold, vals$dea_filters_used,
+                            input$dea_show_significant)
   }, height = 600)
   output$dea_violin_title <- renderText({ if(is.null(input$dea_gene) || input$dea_gene == "") "Select a gene to view expression" else paste("Expression of", input$dea_gene) })
   output$dea_violin_plot <- renderPlot({ req(vals$dea_results, input$dea_gene, vals$data, vals$dea_meta_used); create_gene_violin_plot(vals$data, input$dea_gene, vals$dea_meta_used$col, vals$dea_meta_used$g1, vals$dea_meta_used$g2, vals$dea_filters_used) }, height = function() input$dea_violin_height %||% 500)
@@ -4638,13 +4614,12 @@ server <- function(input, output, session) {
     req(fr)
     validate(need(nrow(fr) > 0,
                   "None of the uploaded genes match the DEA results."))
-    p_thr   <- input$dea_p_threshold %||% 0.05
-    fc_down <- input$dea_logfc_down  %||% -0.585
-    fc_up   <- input$dea_logfc_up    %||% 0.585
+    p_thr  <- input$dea_p_threshold     %||% 0.05
+    fc_thr <- input$dea_logfc_threshold %||% 0.585
     raw <- fr
     if (isTRUE(input$dea_show_significant)) {
       sig_mask <- !is.na(raw$p_val_adj) & raw$p_val_adj < p_thr &
-        !is.na(raw$avg_log2FC) & (raw$avg_log2FC <= fc_down | raw$avg_log2FC >= fc_up)
+        !is.na(raw$avg_log2FC) & abs(raw$avg_log2FC) >= fc_thr
       raw <- raw[sig_mask, , drop = FALSE]
     }
     raw <- raw[order(raw$p_val_adj, na.last = TRUE), , drop = FALSE]
@@ -4656,7 +4631,7 @@ server <- function(input, output, session) {
       pct.1      = round(raw$pct.1, 3),
       pct.2      = round(raw$pct.2, 3),
       Significant = ifelse(!is.na(raw$p_val_adj) & raw$p_val_adj < p_thr &
-                             !is.na(raw$avg_log2FC) & (raw$avg_log2FC <= fc_down | raw$avg_log2FC >= fc_up),
+                             !is.na(raw$avg_log2FC) & abs(raw$avg_log2FC) >= fc_thr,
                            "Yes", ""),
       stringsAsFactors = FALSE
     )
@@ -4666,8 +4641,8 @@ server <- function(input, output, session) {
       rownames = FALSE,
       caption  = tags$caption(
         style = "caption-side: top; text-align: left; color: #2c3e50; font-weight: bold;",
-        sprintf("Rows marked 'Yes' in Significant: p_val_adj < %.3g and (log2FC <= %.3g or log2FC >= %.3g).",
-                p_thr, fc_down, fc_up))
+        sprintf("Rows marked 'Yes' in Significant: p_val_adj < %.3g and |log2FC| >= %.3g.",
+                p_thr, fc_thr))
     )
     DT::formatStyle(dt, "Significant",
                     backgroundColor = DT::styleEqual("Yes", "#e8f5e9"),
@@ -4682,7 +4657,7 @@ server <- function(input, output, session) {
       fr <- dea_filtered_results()
       ggsave(file,
              create_dea_volcano_plot(fr, input$dea_gene, input$dea_p_threshold,
-                                     input$dea_logfc_down, input$dea_logfc_up,
+                                     input$dea_logfc_threshold,
                                      show_significant = input$dea_show_significant),
              width = 12, height = 7)
     }
@@ -4703,9 +4678,8 @@ server <- function(input, output, session) {
         comparison_meta = vals$dea_meta_used %||% list(),
         filter_list     = vals$dea_filters_used %||% list(),
         highlight_gene  = input$dea_gene,
-        p_thr   = input$dea_p_threshold %||% 0.05,
-        fc_down = input$dea_logfc_down  %||% -0.585,
-        fc_up   = input$dea_logfc_up    %||% 0.585
+        p_thr  = input$dea_p_threshold %||% 0.05,
+        fc_thr = input$dea_logfc_threshold %||% 0.585
       ), file)
     }
   )
@@ -4717,10 +4691,7 @@ server <- function(input, output, session) {
   # Status indicator showing whether DEA results are available
   output$go_dea_status_ui <- renderUI({
     if (!is.null(vals$dea_results) && nrow(vals$dea_results) > 0) {
-      p_thr   <- input$dea_p_threshold %||% 0.05
-      fc_down <- input$dea_logfc_down  %||% -0.585
-      fc_up   <- input$dea_logfc_up    %||% 0.585
-      n_sig <- sum(vals$dea_results$p_val_adj < p_thr & (vals$dea_results$avg_log2FC <= fc_down | vals$dea_results$avg_log2FC >= fc_up), na.rm = TRUE)
+      n_sig <- sum(vals$dea_results$p_val_adj < 0.05 & abs(vals$dea_results$avg_log2FC) >= 0.585, na.rm = TRUE)
       div(style = "color: #27ae60; font-weight: bold;", icon("check-circle"),
           paste0(" DEA results ready (", nrow(vals$dea_results), " genes, ", n_sig, " significant)"))
     } else {
@@ -5173,7 +5144,6 @@ server <- function(input, output, session) {
           
           updateSelectInput(session, "dea_meta_col", selected = cache_data$comparison_meta$col)
           vals$dea_filter_list <- cache_data$filter_list; vals$dea_filters_used <- cache_data$filter_list; vals$dea_meta_used <- list(col=cache_data$comparison_meta$col, g1=cache_data$comparison_meta$groups[1], g2=cache_data$comparison_meta$groups[2]); vals$dea_results <- cache_data$results
-          if (!is.null(cache_data$results) && nrow(cache_data$results) > 0) { rng <- range(cache_data$results$avg_log2FC, na.rm = TRUE); lo <- min(floor(rng[1] * 100) / 100, 0); hi <- max(ceiling(rng[2] * 100) / 100, 0); vals$dea_logfc_range <- c(lo, hi); updateNumericInput(session, "dea_logfc_down", min = lo, max = 0); updateNumericInput(session, "dea_logfc_up", min = 0, max = hi) }
           updateNavbarPage(session, "main_nav", selected = "DEA")
         }
         showNotification("Restored from history!", type = "message")
