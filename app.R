@@ -4691,7 +4691,9 @@ server <- function(input, output, session) {
   # Status indicator showing whether DEA results are available
   output$go_dea_status_ui <- renderUI({
     if (!is.null(vals$dea_results) && nrow(vals$dea_results) > 0) {
-      n_sig <- sum(vals$dea_results$p_val_adj < 0.05 & abs(vals$dea_results$avg_log2FC) >= 0.585, na.rm = TRUE)
+      p_thr  <- input$dea_p_threshold     %||% 0.05
+      fc_thr <- input$dea_logfc_threshold %||% 0.585
+      n_sig <- sum(vals$dea_results$p_val_adj < p_thr & abs(vals$dea_results$avg_log2FC) >= fc_thr, na.rm = TRUE)
       div(style = "color: #27ae60; font-weight: bold;", icon("check-circle"),
           paste0(" DEA results ready (", nrow(vals$dea_results), " genes, ", n_sig, " significant)"))
     } else {
