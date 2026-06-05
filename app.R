@@ -833,10 +833,10 @@ create_dea_volcano_plot <- function(dea_results, highlight_gene = NULL, p_thresh
   if (is.null(dea_results) || nrow(dea_results) == 0) return(NULL)
 
   if (show_significant) {
-    dea_results <- dea_results %>% filter(p_val_adj < p_threshold & abs(avg_log2FC) > logfc_threshold)
+    dea_results <- dea_results %>% filter(p_val_adj < p_threshold & abs(avg_log2FC) >= logfc_threshold)
   }
 
-  plot_df <- dea_results %>% mutate(NegLogP = -log10(p_val_adj), NegLogP = ifelse(is.infinite(NegLogP), 300, NegLogP), Significant = p_val_adj < p_threshold & abs(avg_log2FC) > logfc_threshold, IsHighlight = if (!is.null(highlight_gene) && highlight_gene != "") gene == highlight_gene else FALSE) %>% arrange(IsHighlight)
+  plot_df <- dea_results %>% mutate(NegLogP = -log10(p_val_adj), NegLogP = ifelse(is.infinite(NegLogP), 300, NegLogP), Significant = p_val_adj < p_threshold & abs(avg_log2FC) >= logfc_threshold, IsHighlight = if (!is.null(highlight_gene) && highlight_gene != "") gene == highlight_gene else FALSE) %>% arrange(IsHighlight)
   # Label the 10 most relevant genes, not just the first 10 rows: sort by
   # adjusted p-value, breaking ties by larger absolute fold change. Done on a
   # copy so plot_df keeps its IsHighlight draw order (highlighted point on top).
@@ -2011,8 +2011,8 @@ ui <- navbarPage(
                                       numericInput("dea_p_threshold", NULL,
                                                    value = 0.05, min = 0, max = 1, step = 0.001),
                                       helpText("0.05 is the usual significance cutoff; 0.1 is sometimes used. Enter a value between 0 and 1."),
-                                      tags$label("Log2FC threshold:", style = "font-weight: bold;"),
-                                      info_icon("Effect-size cutoff used together with the p-value cutoff."),
+                                      tags$label("Min |log2FC|:", style = "font-weight: bold;"),
+                                      info_icon("Minimum absolute log2 fold change. Genes with |log2FC| at or above this (and an adjusted p-value below the threshold above) are flagged significant - both up- and down-regulated."),
                                       numericInput("dea_logfc_threshold", NULL,
                                                    value = 0.585, min = 0, max = 10, step = 0.05),
                                       helpText("Enter a value of 0 or greater."),
