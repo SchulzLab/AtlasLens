@@ -23,7 +23,27 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 
-RUN R -e "install.packages(c('remotes', 'devtools', 'BiocManager', 'Seurat', 'msigdbr', 'shinycssloaders', 'viridis', 'ggrepel', 'digest', 'future', 'promises', 'DT', 'shinyjs', 'qs', 'RColorBrewer', 'plotly', 'patchwork', 'treemap', 'pheatmap', 'ggrastr'))"
+# Install remotes + BiocManager first so the exact versions below can be pinned.
+RUN R -e "install.packages(c('remotes', 'devtools', 'BiocManager'))"
+
+# Pin the Seurat stack to the versions AtlasLens was validated on (these match
+# the conda environment.yml used on the cluster: Seurat 5.3.0 / SeuratObject
+# 5.2.0 / Matrix 1.6-5). The rocker base image's frozen CRAN snapshot otherwise
+# installs Seurat v4, which - loaded next to SeuratObject v5 - silently enters a
+# broken "v3/v4 compatibility mode" and mangles large objects on load
+# ("replacement has 21025 rows, data has 110824"). Matrix is pinned first
+# because SeuratObject and Seurat compile against its ABI; Matrix 1.6-5 is also
+# the newest release that supports R 4.3.x (1.7.x needs R >= 4.4). cloud.r-project.org
+# is used so these exact versions resolve from CRAN (incl. the archive).
+RUN R -e "remotes::install_version('Matrix', version = '1.6-5', repos = 'https://cloud.r-project.org', upgrade = 'never')"
+RUN R -e "remotes::install_version('SeuratObject', version = '5.2.0', repos = 'https://cloud.r-project.org', upgrade = 'never')"
+RUN R -e "remotes::install_version('Seurat', version = '5.3.0', repos = 'https://cloud.r-project.org', upgrade = 'never')"
+
+# Sanity check: fail the build loudly if the wrong major version slipped in.
+RUN R -e "stopifnot(packageVersion('Seurat') == '5.3.0', packageVersion('SeuratObject') == '5.2.0'); cat('Seurat stack OK:', as.character(packageVersion('Seurat')), '/', as.character(packageVersion('SeuratObject')), '\n')"
+
+# Remaining CRAN packages (Seurat is pinned above).
+RUN R -e "install.packages(c('msigdbr', 'shinycssloaders', 'viridis', 'ggrepel', 'digest', 'future', 'promises', 'DT', 'shinyjs', 'qs', 'RColorBrewer', 'plotly', 'patchwork', 'treemap', 'pheatmap', 'ggrastr'))"
 
 RUN R -e "BiocManager::install('gemma.R')"
 
