@@ -1957,16 +1957,13 @@ ui <- navbarPage(
                                                 "Pick a grouping column and click ", tags$b("Show Plot"), "."),
                                               uiOutput("qc_status_msg"),
                                               fluidRow(column(12, h4("nFeature_RNA"),
-                                                              withSpinner(plotOutput("qc_violin_nFeature"),
-                                                                          type = 6, color = "#27ae60"))),
+                                                              uiOutput("qc_violin_nFeature_ui"))),
                                               tags$div(style = "height: 40px;"),
                                               fluidRow(column(12, h4("nCount_RNA"),
-                                                              withSpinner(plotOutput("qc_violin_nCount"),
-                                                                          type = 6, color = "#27ae60"))),
+                                                              uiOutput("qc_violin_nCount_ui"))),
                                               tags$div(style = "height: 40px;"),
                                               fluidRow(column(12, h4("percent.mt"),
-                                                              withSpinner(plotOutput("qc_violin_percentMt"),
-                                                                          type = 6, color = "#27ae60"))),
+                                                              uiOutput("qc_violin_percentMt_ui"))),
                                               br(),
                                               downloadButton("qc_download_png", "Download all QC violins (PNG)", class = "btn-success"),
                                               downloadButton("qc_download_pdf", "Download all QC violins (PDF)", class = "btn-info")
@@ -3995,6 +3992,15 @@ server <- function(input, output, session) {
     )
   }
   
+  # Each violin's plotOutput container height must track the slider. Otherwise
+  # the plotOutput keeps its default 400px box while the image renders up to
+  # 900px tall, and the overflow covers the download buttons below (making them
+  # unclickable). Rendering the plotOutput inside a uiOutput lets the box height
+  # follow input$qc_plot_height, so container and image always match.
+  output$qc_violin_nFeature_ui  <- renderUI(withSpinner(plotOutput("qc_violin_nFeature",  height = paste0(input$qc_plot_height %||% 550, "px")), type = 6, color = "#27ae60"))
+  output$qc_violin_nCount_ui    <- renderUI(withSpinner(plotOutput("qc_violin_nCount",    height = paste0(input$qc_plot_height %||% 550, "px")), type = 6, color = "#27ae60"))
+  output$qc_violin_percentMt_ui <- renderUI(withSpinner(plotOutput("qc_violin_percentMt", height = paste0(input$qc_plot_height %||% 550, "px")), type = 6, color = "#27ae60"))
+
   output$qc_violin_nFeature  <- renderPlot({
     req(input$show_qc_plot, input$show_qc_plot > 0)
     isolate(qc_plot_for("nFeature_RNA"))
@@ -4073,7 +4079,7 @@ server <- function(input, output, session) {
             icon("exclamation-circle"),
             " This dataset uses Ensembl gene IDs. geneCOCOA needs gene symbols",
             " (its pathway gene sets are symbol-based) - convert them first."),
-        actionButton("cocoa_convert_ensembl", "Convert gene IDs to symbols (biomaRt)",
+        actionButton("cocoa_convert_ensembl", "Convert gene IDs to symbols",
                      class = "btn-info btn-block btn-lg", icon = icon("dna"),
                      style = "font-weight: bold;",
                      # Immediate, client-side feedback. Even when the server
@@ -4137,6 +4143,15 @@ server <- function(input, output, session) {
     # run_btn_ui swaps to the disabled "Converting..." button on the next flush.
     showNotification("Mapping Ensembl IDs to gene symbols using the local annotation database (Ensembl BioMart is only contacted if needed)...",
                      id = "cocoa_convert_msg", type = "message", duration = NULL)
+
+    # Heads-up so users know the conversion is reversible: once it finishes, the
+    # Introduction tab shows a toggle to flip the displayed identifiers back and
+    # forth between gene symbols and Ensembl IDs.
+    showModal(modalDialog(
+      title = tagList(icon("info-circle"), " Gene identifiers"),
+      "Converting gene IDs to symbols. Once it finishes, you can switch between gene symbols and Ensembl IDs at any time using the \"Displayed gene identifiers\" toggle in the Introduction tab.",
+      easyClose = TRUE, footer = modalButton("Got it")
+    ))
 
     future({
       map_ensembl_to_symbol(unique(ens_keys), species)
