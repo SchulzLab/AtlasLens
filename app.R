@@ -93,8 +93,7 @@ options(future.globals.maxSize = 800000 * 1024^2)
 # on, multicore workers are forks that share the already-loaded ~110k-cell
 # Seurat object copy-on-write, so geneCOCOA / DEA futures start instantly.
 # multisession spawns fresh R processes that must *serialize* the whole object
-# to each worker, which slowed the app enormously in testing. Do NOT switch this
-# to multisession to "support Windows" - this app is served from Linux.
+# to each worker, which slowed the app enormously in testing.
 plan(multicore, workers = 4)
 
 # === LOGGING & LOCKING ===
@@ -1210,7 +1209,7 @@ generate_dea_script <- function(comparison_meta, filter_list,
     "Seurat::Idents(seurat_obj) <- seurat_obj@meta.data[[meta_col]]",
     "seurat_obj <- Seurat::NormalizeData(seurat_obj, verbose = FALSE)",
     "markers <- Seurat::FindMarkers(seurat_obj,",
-    "  ident.1 = group2, ident.2 = group1,",
+    "  ident.1 = group1, ident.2 = group2,  # matches AtlasLens: +log2FC = higher in group1",
     "  test.use = 'wilcox', use_presto = TRUE,",
     "  # logfc.threshold = 0 returns all tested genes; fc_thr is applied below",
     "  # only to flag significance (matches the AtlasLens in-app behaviour).",
@@ -1222,7 +1221,24 @@ generate_dea_script <- function(comparison_meta, filter_list,
     "",
     "write.csv(markers, 'atlaslens_dea_results.csv', row.names = FALSE)",
     paste0("message('Wrote ', nrow(markers), ' rows to atlaslens_dea_results.csv',",
-           " ' (', sum(markers$Significant, na.rm = TRUE), ' significant).')")
+           " ' (', sum(markers$Significant, na.rm = TRUE), ' significant).')"),
+    "",
+    "# --- Volcano plot (standalone ggplot2; same 'significant' rule as above) ---",
+    "suppressPackageStartupMessages({ library(ggplot2); library(ggrepel) })",
+    "markers$NegLogP <- pmin(-log10(markers$p_val_adj), 300)",
+    "top_genes <- head(markers$gene[order(markers$p_val_adj, -abs(markers$avg_log2FC))], 10)",
+    "markers$Label <- ifelse(markers$gene %in% top_genes, markers$gene, NA)",
+    "volcano <- ggplot(markers, aes(avg_log2FC, NegLogP, color = Significant)) +",
+    "  geom_point(alpha = 0.5, size = 1.5, na.rm = TRUE) +",
+    "  geom_vline(xintercept = c(-fc_thr, fc_thr), linetype = 'dashed', color = 'grey60') +",
+    "  geom_hline(yintercept = -log10(p_thr), linetype = 'dashed', color = 'grey60') +",
+    "  scale_color_manual(values = c('TRUE' = '#e74c3c', 'FALSE' = '#bdc3c7'), guide = 'none') +",
+    "  ggrepel::geom_text_repel(aes(label = Label), max.overlaps = 20, box.padding = 0.5, na.rm = TRUE) +",
+    "  labs(x = 'Log2 Fold Change', y = '-log10(Adj. P-Value)',",
+    "       title = paste0('Volcano: ', group1, ' vs ', group2)) +",
+    "  theme_minimal(base_size = 14)",
+    "ggsave('atlaslens_volcano.png', volcano, width = 9, height = 7, dpi = 300)",
+    "message('Saved volcano plot to atlaslens_volcano.png')"
   )
   if (!is.null(highlight_gene) && nzchar(highlight_gene)) {
     body <- c(body,
@@ -1277,7 +1293,27 @@ generate_cocoa_script <- function(gene, comparison_meta, filter_list,
     "",
     "saveRDS(results, 'atlaslens_cocoa_results.rds')",
     paste0("message('Saved COCOA results for ', length(results), ' group(s)',",
-           " ' to atlaslens_cocoa_results.rds')")
+           " ' to atlaslens_cocoa_results.rds')"),
+    "",
+    "# --- Co-regulation plot (standalone ggplot2) ---",
+    "suppressPackageStartupMessages({ library(ggplot2) })",
+    "plot_df <- do.call(rbind, lapply(names(results), function(g) {",
+    "  d <- as.data.frame(results[[g]])",
+    "  if (is.null(d) || nrow(d) == 0) return(NULL)",
+    "  if (!('geneset' %in% colnames(d))) d$geneset <- rownames(d)",
+    "  pval <- if ('p.adj' %in% colnames(d)) d$p.adj else d$p",
+    "  data.frame(Pathway = gsub('HALLMARK_', '', d$geneset),",
+    "             NLP = -log10(pval), Group = g, stringsAsFactors = FALSE)",
+    "}))",
+    "plot_df <- plot_df[is.finite(plot_df$NLP), , drop = FALSE]",
+    "coreg <- ggplot(plot_df, aes(NLP, reorder(Pathway, NLP), fill = Group)) +",
+    "  geom_col(position = position_dodge(width = 0.8), width = 0.7, alpha = 0.85) +",
+    "  scale_fill_brewer(palette = 'Set2') +",
+    "  labs(title = paste('Co-regulation:', gene_of_interest),",
+    "       x = '-log10(P-Value)', y = NULL) +",
+    "  theme_minimal(base_size = 14)",
+    "ggsave('atlaslens_cocoa_plot.png', coreg, width = 10, height = 8, dpi = 300)",
+    "message('Saved co-regulation plot to atlaslens_cocoa_plot.png')"
   )
   paste(body, collapse = "\n")
 }
@@ -1343,6 +1379,28 @@ generate_go_script <- function(go_settings, filter_list) {
     "    reduced <- rrvgo::reduceSimMatrix(sim, scores, threshold = 0.7, orgdb = org_db)",
     "    saveRDS(list(sim_matrix = sim, reduced = reduced), 'atlaslens_go_rrvgo.rds')",
     "  }",
+    "}",
+    "",
+    "# --- GO dot plot (standalone ggplot2; works for single + compare modes) ---",
+    "suppressPackageStartupMessages({ library(ggplot2) })",
+    "go_df <- as.data.frame(ego)",
+    "if (nrow(go_df) > 0) {",
+    "  has_cluster <- 'Cluster' %in% colnames(go_df)",
+    "  grp <- if (has_cluster) as.character(go_df$Cluster) else rep('all', nrow(go_df))",
+    "  go_df <- do.call(rbind, by(go_df, grp, function(d) head(d[order(d$p.adjust), , drop = FALSE], 15)))",
+    "  go_df$GeneRatioNum <- vapply(strsplit(as.character(go_df$GeneRatio), '/'),",
+    "                               function(x) as.numeric(x[1]) / as.numeric(x[2]), numeric(1))",
+    "  go_df$NegLogP <- pmin(-log10(go_df$p.adjust), 300)",
+    "  p_go <- ggplot(go_df, aes(GeneRatioNum, reorder(Description, GeneRatioNum),",
+    "                            size = Count, color = NegLogP)) +",
+    "    geom_point() +",
+    "    scale_color_viridis_c(option = 'viridis', name = '-log10(p.adjust)') +",
+    "    scale_size_continuous(name = 'Gene count', range = c(2, 8)) +",
+    "    labs(title = 'GO Enrichment', x = 'GeneRatio', y = NULL) +",
+    "    theme_minimal(base_size = 13)",
+    "  if (has_cluster) p_go <- p_go + facet_wrap(~ Cluster, scales = 'free_y')",
+    "  ggsave('atlaslens_go_dotplot.png', p_go, width = 11, height = 8, dpi = 300)",
+    "  message('Saved GO dot plot to atlaslens_go_dotplot.png')",
     "}",
     "message('GO results saved.')"
   )
@@ -1578,22 +1636,24 @@ custom_header <- tags$head(
     });
   "),
   tags$script(HTML("
-    // Lock a 'Show Plot' button in Dataset Exploration while its plots render.
-    // The button greys out the instant it is clicked - immediate feedback that
-    // the click registered - and the disabled attr blocks new Shiny input
-    // events so rapid clicks cannot queue up multiple 100k-cell renders. It
-    // re-enables once every tracked output finishes (shiny:recalculated) or
-    // errors (shiny:error). Two nets prevent a stuck button: a shiny:idle
-    // fallback for a click that triggers NO render at all (e.g. re-clicking the
-    // same genes, which the Coexpression server intentionally skips), and a
-    // 120s hard timeout if a render is skipped via req().
+    // Lock a 'Show Plot' button while its plots render. The button greys out the
+    // instant it is clicked - immediate feedback that the click registered - and
+    // the disabled attr blocks new Shiny input events so rapid clicks cannot
+    // queue up multiple expensive renders. It re-enables when the tracked outputs
+    // finish: each shiny:recalculated / shiny:error drops a pending counter, and
+    // - because some buttons drive plots that live in SEPARATE subtabs where only
+    // the visible one actually re-renders - a shiny:idle handler also releases the
+    // button once Shiny settles. These renders are synchronous, so idle reliably
+    // fires after they finish; it also covers a click that renders nothing at all
+    // (e.g. re-clicking the same Coexpression genes, which the server skips). A
+    // 120s timer is a final safety net.
     (function() {
       function lockWhileRendering(buttonId, tracked) {
-        var pending = 0, sawRecalc = false, timer = null;
+        var pending = 0, timer = null;
         function btn() { return document.getElementById(buttonId); }
         function isTracked(e) { return e.target && tracked.indexOf(e.target.id) !== -1; }
         function enable() {
-          pending = 0; sawRecalc = false;
+          pending = 0;
           if (timer) { clearTimeout(timer); timer = null; }
           var b = btn();
           if (b) { b.classList.remove('disabled'); b.removeAttribute('disabled'); }
@@ -1601,23 +1661,26 @@ custom_header <- tags$head(
         $(document).on('click', '#' + buttonId, function() {
           var b = btn();
           if (b) { b.classList.add('disabled'); b.setAttribute('disabled', 'disabled'); }
-          pending = tracked.length; sawRecalc = false;
+          pending = tracked.length;
           if (timer) clearTimeout(timer);
           timer = setTimeout(enable, 120000);
         });
-        $(document).on('shiny:recalculating', function(e) { if (isTracked(e)) sawRecalc = true; });
         function done(e) {
           if (isTracked(e) && pending > 0) { pending--; if (pending <= 0) enable(); }
         }
         $(document).on('shiny:recalculated', done);
         $(document).on('shiny:error', done);
-        // Click that produced no tracked render: release once Shiny goes idle.
+        // Release once Shiny goes idle: covers clicks that render only some of the
+        // tracked outputs (plots in hidden subtabs stay suspended) or none at all.
         $(document).on('shiny:idle', function() {
-          if (pending > 0 && !sawRecalc) enable();
+          if (pending > 0) enable();
         });
       }
       lockWhileRendering('show_umap_plot',  ['explore_umap_meta', 'explore_umap_expr']);
       lockWhileRendering('show_coexp_plot', ['coexp_umap_g1', 'coexp_umap_g2']);
+      lockWhileRendering('show_dotplot',    ['explore_dotplot']);
+      lockWhileRendering('show_qc_plot',    ['qc_violin_nFeature', 'qc_violin_nCount', 'qc_violin_percentMt']);
+      lockWhileRendering('ts_show_plot',    ['ts_heatmap_plot', 'ts_expression_plot', 'ts_boxplot', 'ts_trend_expression_plot']);
     })();
   ")),
   tags$style(HTML("

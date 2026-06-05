@@ -61,6 +61,14 @@ RUN R -e "remotes::install_github('immunogenomics/presto')"
 
 
 
+# Re-pin the future/promises ecosystem to the versions AtlasLens was validated
+# with (conda environment.yml). The frozen base-image CRAN snapshot installs a
+# 2023-era `future` that SeuratObject 5.2.0 cannot load ("object
+# 'FutureInterruptError' is not exported by 'namespace:future'"). Done here,
+# AFTER the heavy installs, so it overrides the stale copies WITHOUT invalidating
+# their build cache; dependencies precede the packages that need them.
+RUN R -e "for (pv in list(c('globals','0.18.0'), c('parallelly','1.45.1'), c('listenv','0.9.1'), c('later','1.4.4'), c('future','1.67.0'), c('future.apply','1.20.0'), c('promises','1.3.3'))) remotes::install_version(pv[1], pv[2], repos='https://cloud.r-project.org', upgrade='never')"
+
 # Create app directory
 RUN mkdir -p /srv/shiny-server/app
 
