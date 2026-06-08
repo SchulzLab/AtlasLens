@@ -543,8 +543,8 @@ run_go_worker <- function(gene_list, species, ontology, p_cutoff, q_cutoff,
       keyType       = key_type,
       ont           = ontology,
       pAdjustMethod = "BH",
-      pvalueCutoff  = p_cutoff,
-      qvalueCutoff  = q_cutoff
+      pvalueCutoff  = p_cutoff
+      ,qvalueCutoff  = 0.2
     )
     if (is.null(ego)) return(NULL)
     df <- as.data.frame(ego)
