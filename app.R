@@ -97,23 +97,25 @@ options(future.globals.maxSize = 800000 * 1024^2)
 plan(multicore, workers = 4)
 
 # === LOGGING & LOCKING ===
-
-get_lock_file <- function(filename) {
-  file.path(CACHE_DIR, paste0("lock_", filename, ".txt"))
-}
-
-is_locked <- function(filename) {
-  file.exists(get_lock_file(filename))
-}
-
-set_lock <- function(filename) {
-  file.create(get_lock_file(filename))
-}
-
-remove_lock <- function(filename) {
-  f <- get_lock_file(filename)
-  if (file.exists(f)) unlink(f)
-}
+# Disabled: this file-based lock helper set is currently unused (defined but
+# never called anywhere in the app). Kept commented out in case cross-process
+# cache locking is reintroduced later.
+# get_lock_file <- function(filename) {
+#   file.path(CACHE_DIR, paste0("lock_", filename, ".txt"))
+# }
+#
+# is_locked <- function(filename) {
+#   file.exists(get_lock_file(filename))
+# }
+#
+# set_lock <- function(filename) {
+#   file.create(get_lock_file(filename))
+# }
+#
+# remove_lock <- function(filename) {
+#   f <- get_lock_file(filename)
+#   if (file.exists(f)) unlink(f)
+# }
 
 # === HELPER FUNCTIONS ===
 
