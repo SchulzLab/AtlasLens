@@ -2084,7 +2084,7 @@ ui <- navbarPage(
                                       div(class = "section-header", icon("layer-group"), " 3. Select Metadata"), tags$label("Metadata Column:", style = "font-weight: bold;"), info_icon("Choose the column defining conditions."), selectInput("dea_meta_col", NULL, choices = NULL), hr(),
                                       div(class = "section-header", icon("code-branch"), " 4. Choose Two Submetadata"), tags$label("Submetadata 1 (Reference):", style = "font-weight: bold;"), selectInput("dea_group1", NULL, choices = NULL), tags$label("Submetadata 2 (Comparison):", style = "font-weight: bold;", style = "margin-top: 10px;"), selectInput("dea_group2", NULL, choices = NULL), uiOutput("dea_cell_count_ui"), hr(), 
                                       div(class = "section-header", icon("cogs"), " 5. Options"),
-                                      checkboxInput("dea_show_significant", "Show significant only", value = FALSE),
+                                      checkboxInput("dea_show_significant", "Show the results based on selected values, value = FALSE),
                                       tags$label("Adjusted P-value threshold:", style = "font-weight: bold;"),
                                       info_icon("Genes with p_val_adj below this are flagged significant and highlighted in the results table. Type to override."),
                                       numericInput("dea_p_threshold", NULL,
