@@ -1128,7 +1128,12 @@ create_multi_gene_dotplot <- function(seurat_obj, genes, group_col,
 
 create_cache_key <- function(dataset_hash, filter_list, comparison_meta) {
   filter_str <- if(length(filter_list) > 0) { paste(sapply(filter_list, function(f) paste0(f$col, ":", paste(sort(f$vals), collapse = ","))), collapse = "|") } else { "NOFILTER" }
-  comp_str <- paste0(comparison_meta$col, ":", paste(sort(comparison_meta$groups), collapse = ","))
+  #comp_str <- paste0(comparison_meta$col, ":", paste(sort(comparison_meta$groups), collapse = ","))
+  #preserve order in the cache key                                                         
+  comp_str <- paste0(
+  comparison_meta$col, ":",
+  comparison_meta$groups[1], "_vs_", comparison_meta$groups[2]
+)                                                         
   key_str <- paste(dataset_hash, filter_str, comp_str, sep = "_"); digest(key_str, algo = "md5")
 }
 
