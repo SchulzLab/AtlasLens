@@ -4151,7 +4151,7 @@ server <- function(input, output, session) {
         # restore it.
         return(div(class = "error-box", style = "margin-bottom: 10px;",
                    icon("exclamation-circle"),
-                   " This dataset uses Ensembl gene IDs, but biomaRt is not installed",
+                   " This dataset has EnsemblIDs, but biomaRt is not installed",
                    " in this R environment, so they cannot be converted to the gene",
                    " symbols geneCOCOA needs. Install Bioconductor's biomaRt and",
                    " restart AtlasLens."))
@@ -4159,8 +4159,8 @@ server <- function(input, output, session) {
       return(div(
         div(class = "error-box", style = "margin-bottom: 10px;",
             icon("exclamation-circle"),
-            " This dataset uses Ensembl gene IDs. geneCOCOA needs gene symbols",
-            " (its pathway gene sets are symbol-based) - convert them first."),
+            " This dataset has Ensembl IDs,but geneCOCOA works with gene symbols",
+            " Please convert IDs to symbols first.",
         actionButton("cocoa_convert_ensembl", "Convert gene IDs to symbols",
                      class = "btn-info btn-block btn-lg", icon = icon("dna"),
                      style = "font-weight: bold;",
