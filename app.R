@@ -94,8 +94,16 @@ options(future.globals.maxSize = 800000 * 1024^2)
 # Seurat object copy-on-write, so geneCOCOA / DEA futures start instantly.
 # multisession spawns fresh R processes that must *serialize* the whole object
 # to each worker, which slowed the app enormously in testing.
-plan(multicore, workers = 4)
-
+#plan(multicore, workers = 4)
+  
+if (parallelly::supportsMulticore()) {
+  plan(multicore, workers = 4)
+  message("Config: Using multicore futures (4 workers).")
+} else {
+  plan(multisession, workers = 2)
+  message("Config: multicore unavailable on this platform; using multisession (2 workers).")
+}
+  
 # === LOGGING & LOCKING ===
 # Disabled: this file-based lock helper set is currently unused (defined but
 # never called anywhere in the app). Kept commented out in case cross-process
@@ -343,15 +351,15 @@ detect_control_conditions <- function(conds) {
 }
 
 get_expanded_palette <- function(n) {
-  # A manually curated list of 55 highly distinct colors to avoid "muddy" interpolation
+  # A manually curated list of 51 highly distinct colors to avoid "muddy" interpolation
   distinct_colors <- c(
-    "#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FF7F00", "#FFFF33", "#A65628", "#F781BF", 
+    "#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", "#FFFF33", "#A65628", "#F781BF", 
     "#1B9E77", "#D95F02", "#7570B3", "#E7298A", "#66A61E", "#E6AB02", "#A6761D", "#666666",
     "#8DD3C7", "#FFFFB3", "#BEBADA", "#FB8072", "#80B1D3", "#FDB462", "#B3DE69", "#FCCDE5",
-    "#A6CEE3", "#1F78B4", "#B2DF8A", "#33A02C", "#FB9A99", "#E31A1C", "#FDBF6F", "#FF7F00",
+    "#A6CEE3", "#1F78B4", "#B2DF8A", "#33A02C", "#FB9A99", "#FDBF6F", "#FF7F00",
     "#CAB2D6", "#6A3D9A", "#FFFF99", "#B15928", "#FBB4AE", "#B3CDE3", "#CCEBC5", "#DECBE4", 
     "#FED9A6", "#FFFFCC", "#E5D8BD", "#FDDAEC", "#8C564B", "#C49C94", "#E377C2", "#F7B6D2", 
-    "#7F7F7F", "#C7C7C7", "#BCBD22", "#DBDB8D", "#17BECF", "#9EDAE5", "#1f77b4"
+    "#7F7F7F", "#C7C7C7", "#BCBD22", "#DBDB8D", "#17BECF", "#9EDAE5"
   )
   
   if (n <= length(distinct_colors)) {
@@ -975,11 +983,15 @@ ensure_qc_columns <- function(seurat_obj) {
                        error = function(e) NULL)
   }
   if (is.null(counts) || ncol(counts) == 0 || nrow(counts) == 0) {
-    # Cannot recompute. Record sentinel zeros for the columns still missing so
-    # downstream code does not branch on column existence forever.
-    if (!"nCount_RNA"   %in% colnames(md)) md$nCount_RNA   <- 0
-    if (!"nFeature_RNA" %in% colnames(md)) md$nFeature_RNA <- 0
-    if (!"percent.mt"   %in% colnames(md)) md$percent.mt   <- 0
+    #if they dont exist, show warning 
+    warning("AtlasLens: Could not access counts matrix — QC columns set to NA sentinel.")
+   # if (!"nCount_RNA"   %in% colnames(md)) md$nCount_RNA   <- 0
+   # if (!"nFeature_RNA" %in% colnames(md)) md$nFeature_RNA <- 0
+   # if (!"percent.mt"   %in% colnames(md)) md$percent.mt   <- 0
+    # NA will be assigned so ggplot would be empty
+    if (!"nCount_RNA"   %in% colnames(md)) md$nCount_RNA   <- NA_real_
+    if (!"nFeature_RNA" %in% colnames(md)) md$nFeature_RNA <- NA_real_
+    if (!"percent.mt"   %in% colnames(md)) md$percent.mt   <- NA_real_
     seurat_obj@meta.data <- md
     return(seurat_obj)
   }
@@ -4388,7 +4400,8 @@ server <- function(input, output, session) {
     meta_data_subset <- obj@meta.data[final_cells_to_keep, , drop = FALSE]
     # Log-transform paper-grade mode is currently disabled in the UI; the
     # worker is therefore always called with the fast configuration.
-    log_transform_flag <- FALSE
+    #log_transform_flag <- FALSE
+    log_transform_flag <- TRUE #log2 transform CPM
     n_sims_cfg <- 100L
     # Species inference for msigdbr gene-set lookup.
     species_cfg <- detect_species(vals$data)
@@ -4490,7 +4503,7 @@ server <- function(input, output, session) {
       if (vals$dea_history_pending$g1 %in% available_groups && vals$dea_history_pending$g2 %in% available_groups) {
         selected_g1 <- vals$dea_history_pending$g1
         selected_g2 <- vals$dea_history_pending$g2
-        vals$dea_history_pending <- NULL # Reset when fully applied
+       vals$dea_history_pending <- NULL # Reset when fully applied
       } else {
         selected_g1 <- vals$dea_history_pending$g1
         selected_g2 <- vals$dea_history_pending$g2
