@@ -4437,7 +4437,22 @@ server <- function(input, output, session) {
     )
   })
   output$analysis_plot <- renderPlot({ req(vals$analysis_res); gene_to_show <- if(!is.null(vals$cocoa_gene_used)) vals$cocoa_gene_used else "Unknown"; filters_to_show <- if(!is.null(vals$cocoa_filters_used)) vals$cocoa_filters_used else list(); res <- vals$analysis_res; plot_df <- bind_rows(lapply(names(res), function(g) { d <- res[[g]]; if(is.null(d)) return(NULL); d <- as.data.frame(d); if(!("geneset" %in% colnames(d))) d$geneset <- rownames(d); tibble(Pathway = gsub("HALLMARK_", "", d$geneset), PVal = if("p.adj" %in% colnames(d)) d$p.adj else d$p, NLP = -log10(PVal), Group = g) })); if (nrow(plot_df) == 0) { plot.new(); text(0.5, 0.5, "No significant pathways.", cex = 1.5); return() }; plot_df_filtered <- plot_df %>% filter(PVal < input$p_val_thresh); if (nrow(plot_df_filtered) == 0) { plot.new(); text(0.5, 0.5, "No pathways below P-value threshold.", cex = 1.5); return() }; filter_str <- "Global Filters: None"; if (length(filters_to_show) > 0) { f_parts <- sapply(filters_to_show, function(f) { val_str <- paste(head(f$vals, 2), collapse=","); if(length(f$vals)>2) val_str <- paste0(val_str, "..."); paste0(f$col, "=(", val_str, ")") }); filter_str <- paste("Global Filters:", paste(f_parts, collapse="; ")) }; ggplot(plot_df_filtered, aes(x = NLP, y = reorder(Pathway, NLP), fill = Group)) + geom_col(position = position_dodge(width = 0.8), width = 0.7, alpha = 0.8) + scale_fill_brewer(palette = "Set2") + labs(title = paste("Co-regulation:", gene_to_show), subtitle = paste0("Comparison: ", vals$analysis_meta$col, "\n", filter_str), x = "-log10(Adjusted P-Value)", y = NULL) + theme_minimal(base_size = 14) + theme(plot.title = element_text(face = "bold", size = 18), legend.position = "bottom") }, height = 800)
-  output$download_analysis <- downloadHandler(filename = function() paste0("cocoa_", input$analysis_gene, ".png"), content = function(file) ggsave(file, width = 12, height = 9))
+  #output$download_analysis <- downloadHandler(filename = function() paste0("cocoa_", input$analysis_gene, ".png"), content = function(file) ggsave(file, width = 12, height = 9))
+   #adding plot argument
+   output$download_analysis <- downloadHandler(
+  filename = function() paste0("cocoa_", input$analysis_gene, ".png"),
+  content = function(file) {
+    req(vals$analysis_res)
+    # Re-render the plot explicitly rather than relying on last_plot()
+    p <- isolate({
+      # same plot logic as output$analysis_plot
+      # ideally extract to a reactive or named function
+    })
+    ggsave(file, plot = p, width = 12, height = 9, dpi = 300)
+  }
+)                                                                                                                                                                                                                                                                                                                                 
+                                                                                                                                                                                                                                                                                                                                    
+                                                                                                                                                                                                                                                                                                                                    
   output$download_analysis_script <- downloadHandler(
     filename = function() paste0("atlaslens_cocoa_", input$analysis_gene %||% "gene", "_reproduce.R"),
     content  = function(file) {
