@@ -40,6 +40,12 @@ if (!exists("%||%", mode = "function")) {
 # `export DATASET_PATH=...` before launching R. When the variable is unset
 # DEFAULT_DATA_PATH stays NULL and the Introduction tab surfaces a clear
 # user-facing notice instead of trying to load from a hard-coded location.
+
+# Local-development convenience only: uncomment ONE of these to point the app at a
+# dataset on your own machine instead of exporting DATASET_PATH in the shell.
+# Left commented in the shared/main app so the env-var-driven design above stays intact.
+#Sys.setenv(DATASET_PATH = "~/Desktop/PhD/ML_project/SCVI/data/App/tabula_muris_seurat_with_ZK.rds")
+#Sys.setenv(DATASET_PATH = "~/Desktop/PhD/ML_project/SCVI/data/AMI_second_version/AMI.data.sets_V2.RDS")
 env_data_path <- Sys.getenv("DATASET_PATH")
 
 if (nzchar(env_data_path)) {
@@ -80,6 +86,16 @@ COCOA_MAX_CELLS <- 500 # Limit cells per group for COCOA speed (Downsampling thr
 # into a selectInput freezes the browser. The Dataset Overview lists them under a
 # dedicated "High-cardinality" bucket so nothing is silently dropped.
 MAX_LEVELS_FOR_GROUPING <- 1000L
+
+# Fixed, paper-defined "significant" call for differential expression. A gene is
+# significant ONLY when its adjusted p-value is below DEA_SIG_P_FIXED AND its
+# absolute log2 fold change is at least DEA_SIG_LOGFC_FIXED (0.585 = log2(1.5),
+# i.e. a 1.5-fold change). These never change with the sidebar controls: the
+# sidebar's "Adjusted P-value threshold" / "Min |log2FC|" define a separate,
+# user-adjustable EXPLORATORY range, surfaced as its own results-table column.
+DEA_SIG_P_FIXED     <- 0.05
+DEA_SIG_LOGFC_FIXED <- 0.585
+
 # On-screen UMAP rasterisation density (ggrastr geom_point_rast). The renderPlot
 # device is ~110 DPI, so a higher raster.dpi supersamples - it computes far more
 # pixels than the screen shows and is actually SLOWER than plain points. Keep
@@ -94,8 +110,11 @@ options(future.globals.maxSize = 800000 * 1024^2)
 # Seurat object copy-on-write, so geneCOCOA / DEA futures start instantly.
 # multisession spawns fresh R processes that must *serialize* the whole object
 # to each worker, which slowed the app enormously in testing.
-#plan(multicore, workers = 4)
-  
+
+# multicore (forking) is only available on Linux/macOS; it is NOT supported on
+# Windows, where future silently runs futures sequentially. Keep the platform
+# check so the app still parallelises (via multisession) on Windows instead of
+# blocking the UI on every geneCOCOA / DEA / GO run.
 if (parallelly::supportsMulticore()) {
   plan(multicore, workers = 4)
   message("Config: Using multicore futures (4 workers).")
@@ -103,7 +122,7 @@ if (parallelly::supportsMulticore()) {
   plan(multisession, workers = 2)
   message("Config: multicore unavailable on this platform; using multisession (2 workers).")
 }
-  
+
 # === LOGGING & LOCKING ===
 # Disabled: this file-based lock helper set is currently unused (defined but
 # never called anywhere in the app). Kept commented out in case cross-process
@@ -172,9 +191,9 @@ get_valid_metadata_columns <- function(seurat_obj, show_hidden = FALSE) {
     v <- meta[[col]]; v <- v[!is.na(v)]
     length(unique(v)) > MAX_LEVELS_FOR_GROUPING
   }, logical(1))
-
+  
   if (show_hidden) return(cols[is_atomic_col & !is_high_card])
-
+  
   blacklist <- c("n_genes", "n_counts", "observation_joinid",
                  "nCount_RNA", "nFeature_RNA")
   is_blacklisted <- cols %in% blacklist
@@ -226,7 +245,7 @@ get_hidden_metadata_columns <- function(seurat_obj) {
 detect_role_columns <- function(meta) {
   cols <- colnames(meta)
   if (length(cols) == 0) return(list())
-
+  
   # A timepoint column must not only be NAMED like a timepoint, its VALUES
   # must actually look like ordered timepoints. This rejects columns whose
   # values are ontology identifiers (e.g. "PARO:0000461", "CL:0000236") or
@@ -260,7 +279,7 @@ detect_role_columns <- function(meta) {
     # temporal column.
     mean(vapply(lt, looks_timed, logical(1))) >= 0.8
   }
-
+  
   pick <- function(patterns, validate = NULL) {
     for (p in patterns) {
       for (h in grep(p, cols, ignore.case = TRUE, value = TRUE)) {
@@ -503,10 +522,11 @@ run_dea_worker <- function(subset_counts, subset_meta, meta_col, group1, group2)
       # filtering is applied later at display time via the sidebar cutoff.
       # min.pct = 0.1 keeps the standard detection filter (gene seen in >=10%
       # of cells in at least one group).
-      markers <- Seurat::FindMarkers(mini_seurat, ident.1 = group1, ident.2 = group2,
+      markers <- Seurat::FindMarkers(mini_seurat, ident.1 = group2, ident.2 = group1,
                                      test.use = "wilcox", use_presto = TRUE,
                                      logfc.threshold = 0, min.pct = 0.1, verbose = FALSE,
                                      assay = "RNA", slot = "data", recorrect_umi = FALSE)
+      # dea_universe <- rownames(seurat_obj)
     })
   })
   gc()
@@ -528,8 +548,12 @@ run_dea_worker <- function(subset_counts, subset_meta, meta_col, group1, group2)
 #
 # org_db / ontology are passed through to rrvgo because the reduction step
 # needs them to look up GO term annotations.
+
+# run_go_worker <- function(gene_list, species, ontology, p_cutoff, q_cutoff,
+#                           mode, key_type) {
+#Shamim
 run_go_worker <- function(gene_list, species, ontology, p_cutoff, q_cutoff,
-                          mode, key_type) {
+                          mode, key_type, universe = NULL) {
   org_db <- if (species == "Homo sapiens") "org.Hs.eg.db" else "org.Mm.eg.db"
   
   # Run clusterProfiler::enrichGO on one gene set and return a plain data
@@ -539,12 +563,14 @@ run_go_worker <- function(gene_list, species, ontology, p_cutoff, q_cutoff,
     if (length(genes) < 1) return(NULL)
     ego <- clusterProfiler::enrichGO(
       gene          = genes,
+      universe      = universe, #Shamim
       OrgDb         = org_db,
       keyType       = key_type,
       ont           = ontology,
       pAdjustMethod = "BH",
-      pvalueCutoff  = p_cutoff
-      ,qvalueCutoff  = q_cutoff
+      pvalueCutoff  = p_cutoff,
+      qvalueCutoff  = q_cutoff
+      
     )
     if (is.null(ego)) return(NULL)
     df <- as.data.frame(ego)
@@ -620,7 +646,10 @@ create_go_dotplot <- function(df_list, top_n = 15) {
   p <- ggplot(plot_df, aes(x = GeneRatio, y = Description,
                            size = Count, color = neglog_padj)) +
     geom_point() +
-    scale_color_viridis_c(option = "viridis", name = "-log10(p.adjust)") +
+    #scale_color_viridis_c(option = "viridis", name = "-log10(p.adjust)") +
+    #Shamim
+    scale_color_viridis_c(option = "viridis", name = "-log10(p.adjust)",
+                          labels = function(x) formatC(x, format = "f", digits = 2)) +
     scale_size_continuous(name = "Gene count", range = c(2, 8)) +
     labs(title = "GO Enrichment", x = "GeneRatio", y = NULL) +
     atlas_theme(base_size = 13) +
@@ -742,7 +771,7 @@ run_biomart_query <- function(ens_ids, species) {
 map_ensembl_to_symbol <- function(ens_ids, species) {
   ens_ids <- unique(ens_ids)
   org_pkg <- if (species == "Homo sapiens") "org.Hs.eg.db" else "org.Mm.eg.db"
-
+  
   offline <- NULL
   if (requireNamespace(org_pkg, quietly = TRUE) &&
       requireNamespace("AnnotationDbi", quietly = TRUE)) {
@@ -759,14 +788,14 @@ map_ensembl_to_symbol <- function(ens_ids, species) {
   }
   # Good local coverage -> done, no network call at all.
   if (!is.null(offline) && nrow(offline) >= 0.5 * length(ens_ids)) return(offline)
-
+  
   # Otherwise try Ensembl BioMart (broader, but depends on Ensembl being up).
   online <- tryCatch(run_biomart_query(ens_ids, species), error = function(e) e)
   if (inherits(online, "data.frame") && nrow(online) > 0) return(online)
-
+  
   # BioMart unreachable too -> use whatever the local OrgDb managed, even if sparse.
   if (!is.null(offline) && nrow(offline) > 0) return(offline)
-
+  
   stop(if (inherits(online, "condition")) conditionMessage(online)
        else paste0("No Ensembl-to-symbol mappings found in the local '", org_pkg,
                    "' database, and Ensembl BioMart was unreachable."),
@@ -840,12 +869,22 @@ placeholder_plot <- function(msg = "Click \"Show Plot\" to render this view.") {
 
 create_dea_volcano_plot <- function(dea_results, highlight_gene = NULL, p_threshold = 0.05, logfc_threshold = 0.25, filter_list = NULL, show_significant = FALSE) {
   if (is.null(dea_results) || nrow(dea_results) == 0) return(NULL)
+  
+  # "Significant" is the FIXED, paper-defined call (grey dashed lines + red
+  # points) and never changes with the sidebar. The sidebar's adj-p / min|log2FC|
+  # define a separate, user-adjustable EXPLORATORY "selected range" drawn as blue
+  # dotted lines. p_threshold / logfc_threshold carry those sidebar values.
+  p_fixed  <- DEA_SIG_P_FIXED
+  fc_fixed <- DEA_SIG_LOGFC_FIXED
 
+  # "Show significant only" filters to the FIXED significant set, matching the
+  # results table.
   if (show_significant) {
-    dea_results <- dea_results %>% filter(p_val_adj < p_threshold & abs(avg_log2FC) >= logfc_threshold)
+    dea_results <- dea_results %>% filter(p_val_adj < p_fixed & abs(avg_log2FC) >= fc_fixed)
+    if (nrow(dea_results) == 0) return(NULL)
   }
 
-  plot_df <- dea_results %>% mutate(NegLogP = -log10(p_val_adj), NegLogP = ifelse(is.infinite(NegLogP), 300, NegLogP), Significant = p_val_adj < p_threshold & abs(avg_log2FC) >= logfc_threshold, IsHighlight = if (!is.null(highlight_gene) && highlight_gene != "") gene == highlight_gene else FALSE) %>% arrange(IsHighlight)
+  plot_df <- dea_results %>% mutate(NegLogP = -log10(p_val_adj), NegLogP = ifelse(is.infinite(NegLogP), 300, NegLogP), Significant = p_val_adj < p_fixed & abs(avg_log2FC) >= fc_fixed, IsHighlight = if (!is.null(highlight_gene) && highlight_gene != "") gene == highlight_gene else FALSE) %>% arrange(IsHighlight)
   # Label the 10 most relevant genes, not just the first 10 rows: sort by
   # adjusted p-value, breaking ties by larger absolute fold change. Done on a
   # copy so plot_df keeps its IsHighlight draw order (highlighted point on top).
@@ -854,17 +893,38 @@ create_dea_volcano_plot <- function(dea_results, highlight_gene = NULL, p_thresh
   plot_df$Label <- ifelse(plot_df$gene %in% label_genes, plot_df$gene, NA)
   filter_str <- "Global Filters: None"
   if (!is.null(filter_list) && length(filter_list) > 0) { f_parts <- sapply(filter_list, function(f) { val_str <- paste(head(f$vals, 2), collapse=","); if(length(f$vals)>2) val_str <- paste0(val_str, "..."); paste0(f$col, "=(", val_str, ")") }); filter_str <- paste("Global Filters:", paste(f_parts, collapse="; ")) }
-  
+
+  # Only draw the selected-range lines when the user has moved a threshold off
+  # the fixed cutoff; otherwise they'd sit exactly on the grey significance lines.
+  show_range <- !isTRUE(all.equal(p_threshold, p_fixed)) ||
+    !isTRUE(all.equal(logfc_threshold, fc_fixed))
+  caption_txt <- paste0(
+    sprintf("Grey dashed = fixed significance cutoff (adj. p < %.3g and |log2FC| >= %.3g) -> red points = Significant.",
+            p_fixed, fc_fixed),
+    if (show_range)
+      sprintf("\nBlue dotted = your sidebar selected range (adj. p < %.3g and |log2FC| >= %.3g) - exploratory, does not change the Significant call.",
+              p_threshold, logfc_threshold)
+    else "\nSidebar selected range currently matches the fixed cutoff.")
+
   # UPDATED: Use linewidth instead of size
-  p <- ggplot(plot_df, aes(x = avg_log2FC, y = NegLogP)) + 
-    geom_point(aes(color = Significant), alpha = 0.5, size = 1.5, na.rm = TRUE) + 
-    geom_vline(xintercept = c(-logfc_threshold, logfc_threshold), linetype = "dashed", color = "#95a5a6", alpha = 0.6, linewidth = 0.8) +
-    geom_hline(yintercept = -log10(p_threshold), linetype = "dashed", color = "#95a5a6", alpha = 0.6, linewidth = 0.8) + 
-    scale_color_manual(values = c("TRUE" = "#e74c3c", "FALSE" = "#bdc3c7"), guide = "none") + 
-    geom_text_repel(aes(label = Label), max.overlaps = 20, box.padding = 0.5, na.rm = TRUE) + 
-    labs(title = paste0("Volcano Plot: ", dea_results$group1[1], " vs ", dea_results$group2[1]), subtitle = paste0(if(!is.null(highlight_gene) && highlight_gene != "") paste("Highlighted Gene:", highlight_gene) else "All Genes", "\n", filter_str), x = "Log2 Fold Change", y = "-log10(Adj. P-Value)") +
-    theme_minimal(base_size = 14) + theme(plot.title = element_text(face = "bold"))
-  
+  p <- ggplot(plot_df, aes(x = avg_log2FC, y = NegLogP)) +
+    geom_point(aes(color = Significant), alpha = 0.5, size = 1.5, na.rm = TRUE) +
+    geom_vline(xintercept = c(-fc_fixed, fc_fixed), linetype = "dashed", color = "#7f8c8d", alpha = 0.8, linewidth = 0.8) +
+    geom_hline(yintercept = -log10(p_fixed), linetype = "dashed", color = "#7f8c8d", alpha = 0.8, linewidth = 0.8) +
+    scale_color_manual(values = c("TRUE" = "#e74c3c", "FALSE" = "#bdc3c7"),
+                       breaks = c("TRUE", "FALSE"),
+                       labels = c("TRUE" = "Significant", "FALSE" = "Not significant"),
+                       name = sprintf("Significant (fixed)\nadj. p < %.3g & |log2FC| >= %.3g", p_fixed, fc_fixed)) +
+    geom_text_repel(aes(label = Label), max.overlaps = 20, box.padding = 0.5, na.rm = TRUE) +
+    labs(title = paste0("Volcano Plot: ", dea_results$group1[1], " vs ", dea_results$group2[1]), subtitle = paste0(if(!is.null(highlight_gene) && highlight_gene != "") paste("Highlighted Gene:", highlight_gene) else "All Genes", "\n", filter_str), x = "Log2 Fold Change", y = "-log10(Adj. P-Value)", caption = caption_txt) +
+    theme_minimal(base_size = 14) + theme(plot.title = element_text(face = "bold"), legend.position = "right", plot.caption = element_text(hjust = 0, size = 10, color = "#555555"))
+
+  if (show_range) {
+    p <- p +
+      geom_vline(xintercept = c(-logfc_threshold, logfc_threshold), linetype = "dotted", color = "#2980b9", alpha = 0.9, linewidth = 0.8) +
+      geom_hline(yintercept = -log10(p_threshold), linetype = "dotted", color = "#2980b9", alpha = 0.9, linewidth = 0.8)
+  }
+
   if (!is.null(highlight_gene) && highlight_gene != "") p <- p + geom_point(data = subset(plot_df, IsHighlight), color = "black", fill = "yellow", shape = 21, size = 5, stroke = 1.5, na.rm = TRUE)
   return(p)
 }
@@ -985,9 +1045,9 @@ ensure_qc_columns <- function(seurat_obj) {
   if (is.null(counts) || ncol(counts) == 0 || nrow(counts) == 0) {
     #if they dont exist, show warning 
     warning("AtlasLens: Could not access counts matrix — QC columns set to NA sentinel.")
-   # if (!"nCount_RNA"   %in% colnames(md)) md$nCount_RNA   <- 0
-   # if (!"nFeature_RNA" %in% colnames(md)) md$nFeature_RNA <- 0
-   # if (!"percent.mt"   %in% colnames(md)) md$percent.mt   <- 0
+    # if (!"nCount_RNA"   %in% colnames(md)) md$nCount_RNA   <- 0
+    # if (!"nFeature_RNA" %in% colnames(md)) md$nFeature_RNA <- 0
+    # if (!"percent.mt"   %in% colnames(md)) md$percent.mt   <- 0
     # NA will be assigned so ggplot would be empty
     if (!"nCount_RNA"   %in% colnames(md)) md$nCount_RNA   <- NA_real_
     if (!"nFeature_RNA" %in% colnames(md)) md$nFeature_RNA <- NA_real_
@@ -1143,9 +1203,9 @@ create_cache_key <- function(dataset_hash, filter_list, comparison_meta) {
   #comp_str <- paste0(comparison_meta$col, ":", paste(sort(comparison_meta$groups), collapse = ","))
   #preserve order in the cache key                                                         
   comp_str <- paste0(
-  comparison_meta$col, ":",
-  comparison_meta$groups[1], "_vs_", comparison_meta$groups[2]
-)                                                         
+    comparison_meta$col, ":",
+    comparison_meta$groups[1], "_vs_", comparison_meta$groups[2]
+  )                                                         
   key_str <- paste(dataset_hash, filter_str, comp_str, sep = "_"); digest(key_str, algo = "md5")
 }
 
@@ -1704,6 +1764,24 @@ custom_header <- tags$head(
   ")),
   tags$style(HTML("
     body { font-family: 'Segoe UI', sans-serif; background-color: #f5f5f5; zoom: 0.8125; }
+    /* The body `zoom: 0.8125` above shrinks the whole UI, but CSS `zoom` desyncs
+       the browser's mouse coordinates from element box metrics, so Shiny's
+       click-and-drag brush rectangle on the Dataset-exploration UMAPs no longer
+       tracks the cursor. Counter-zoom just those two plots back to an effective
+       100% (0.8125 * 1.2308 ~= 1) so the brush coordinate math is consistent.
+       The matching width keeps each plot inside its half-width column despite
+       the larger zoom factor. */
+    #explore_umap_meta, #explore_umap_expr { zoom: 1.23076923; width: 81.25% !important; }
+    /* Same CSS-zoom hit-testing problem as the UMAPs above, but for the numeric
+       value boxes in the analysis tabs: under the body zoom, clicking a small
+       number field lands just outside its editable area, so no caret appears and
+       you cannot type into it (only the spinner arrows respond). Counter-zoom the
+       fields back to an effective 100% so clicks register; the matching width
+       keeps each box inside its sidebar form group despite the larger zoom. */
+    #p_val_thresh, #dea_p_threshold, #dea_logfc_threshold,
+    #go_p_cutoff, #go_logfc_cutoff, #go_q_cutoff {
+      zoom: 1.23076923; width: 81.25% !important;
+    }
     .irs-line, .irs-grid, .irs-line-mid, .irs-line-left, .irs-line-right { pointer-events: none !important; }
     .irs-handle { pointer-events: auto !important; }
     /* Applied to a sidebar's config wrapper to freeze every control inside it
@@ -1755,18 +1833,28 @@ custom_header <- tags$head(
     input, textarea, select, .selectize-input { caret-color: auto !important; }
 
     /* === NOTIFICATIONS: top-centre, wider, errors prominent === */
-    /* Move the whole stack from the default bottom-right corner to the top
-       centre of the viewport so users see error messages immediately. */
+    /* Move the whole stack from the default bottom-right corner to the dead
+       centre of the viewport so users see error / status messages immediately. */
     #shiny-notification-panel {
       position: fixed !important;
-      top: 18px !important;
+      top: 50% !important;
       bottom: auto !important;
       left: 50% !important;
       right: auto !important;
-      transform: translateX(-50%);
+      transform: translate(-50%, -50%);
       width: auto !important;
       max-width: 700px;
       z-index: 99999;
+    }
+    /* Centre modal dialogs too (Bootstrap 3 anchors them near the top by
+       default). This covers the gene-identifier conversion notice that tells
+       users they can switch between gene symbols and Ensembl IDs. */
+    .modal-dialog {
+      position: absolute !important;
+      top: 50% !important;
+      left: 50% !important;
+      transform: translate(-50%, -50%) !important;
+      margin: 0 !important;
     }
     .shiny-notification {
       width: 640px !important;
@@ -2079,36 +2167,39 @@ ui <- navbarPage(
            div(class = "title-panel", h1("Differential Expression Analysis")),
            sidebarLayout(sidebarPanel(width = 3, 
                                       div(id = "dea_config_wrap",
-                                      div(class = "section-header", style = "margin-top: 0;", icon("dna"), " 1. Select Gene to Highlight (Optional)"), tags$label("Highlight Gene:", style = "font-weight: bold;"), info_icon("Optional. Select a gene to highlight on the plot."), selectizeInput("dea_gene", NULL, NULL, options = list(placeholder = "Type gene name (optional)...", loadThrottle = 500, maxOptions = 100)), uiOutput("dea_gene_info"), hr(), 
-                                      div(class = "section-header", icon("filter"), " 2. Extra Filtering (Optional)"), tags$label("Subset Data:"), info_icon("Narrow down cells for comparison."), uiOutput("dea_filter_controls_ui"), uiOutput("dea_active_filters_ui"), hr(), 
-                                      div(class = "section-header", icon("layer-group"), " 3. Select Metadata"), tags$label("Metadata Column:", style = "font-weight: bold;"), info_icon("Choose the column defining conditions."), selectInput("dea_meta_col", NULL, choices = NULL), hr(),
-                                      div(class = "section-header", icon("code-branch"), " 4. Choose Two Submetadata"), tags$label("Submetadata 1 (Reference):", style = "font-weight: bold;"), selectInput("dea_group1", NULL, choices = NULL), tags$label("Submetadata 2 (Comparison):", style = "font-weight: bold;", style = "margin-top: 10px;"), selectInput("dea_group2", NULL, choices = NULL), uiOutput("dea_cell_count_ui"), hr(), 
-                                      div(class = "section-header", icon("cogs"), " 5. Options"),
-                                      checkboxInput("dea_show_significant", "Show the results based on selected values, value = FALSE),
-                                      tags$label("Adjusted P-value threshold:", style = "font-weight: bold;"),
-                                      info_icon("Genes with p_val_adj below this are flagged significant and highlighted in the results table. Type to override."),
-                                      numericInput("dea_p_threshold", NULL,
-                                                   value = 0.05, min = 0, max = 1, step = 0.001),
-                                      helpText("0.05 is the usual significance cutoff; 0.1 is sometimes used. Enter a value between 0 and 1."),
-                                      tags$label("Min |log2FC|:", style = "font-weight: bold;"),
-                                      info_icon("Minimum absolute log2 fold change. Genes with |log2FC| at or above this (and an adjusted p-value below the threshold above) are flagged significant - both up- and down-regulated."),
-                                      numericInput("dea_logfc_threshold", NULL,
-                                                   value = 0.585, min = 0, max = 10, step = 0.05),
-                                      helpText("Enter a value of 0 or greater."),
-                                      sliderInput("dea_volcano_height", "Volcano plot height (px):",
-                                                  min = 400, max = 1100, value = 650, step = 25),
-                                      sliderInput("dea_violin_height", "Single-gene violin height (px):",
-                                                  min = 300, max = 800, value = 500, step = 25),
-                                      hr(),
-                                      div(class = "section-header", icon("file-upload"), " 6. Restrict to a Custom Gene List (Optional)"),
-                                      tags$label("Upload a CSV or TXT file with one column of gene symbols. The volcano plot, results table, and downloads will be restricted to genes in this list. The Time Series tab's cluster export produces a compatible file."),
-                                      info_icon("Accepts a CSV with a 'gene' column or a plain text file with one gene per line. Use the Time Series tab's 'Download cluster genes' button to generate one."),
-                                      fileInput("dea_gene_upload", NULL,
-                                                accept = c(".csv", ".txt", ".tsv"),
-                                                buttonLabel = "Choose file...",
-                                                placeholder = "No file uploaded"),
-                                      uiOutput("dea_custom_genes_status_ui"),
-                                      uiOutput("dea_custom_genes_clear_ui")),
+                                          div(class = "section-header", style = "margin-top: 0;", icon("dna"), " 1. Select Gene to Highlight (Optional)"), tags$label("Highlight Gene:", style = "font-weight: bold;"), info_icon("Optional. Select a gene to highlight on the plot."), selectizeInput("dea_gene", NULL, NULL, options = list(placeholder = "Type gene name (optional)...", loadThrottle = 500, maxOptions = 100)), uiOutput("dea_gene_info"), hr(), 
+                                          div(class = "section-header", icon("filter"), " 2. Extra Filtering (Optional)"), tags$label("Subset Data:"), info_icon("Narrow down cells for comparison."), uiOutput("dea_filter_controls_ui"), uiOutput("dea_active_filters_ui"), hr(), 
+                                          div(class = "section-header", icon("layer-group"), " 3. Select Metadata"), tags$label("Metadata Column:", style = "font-weight: bold;"), info_icon("Choose the column defining conditions."), selectInput("dea_meta_col", NULL, choices = NULL), hr(),
+                                          div(class = "section-header", icon("code-branch"), " 4. Choose Two Submetadata"), tags$label("Submetadata 1 (Reference):", style = "font-weight: bold;"), selectInput("dea_group1", NULL, choices = NULL), tags$label("Submetadata 2 (Comparison):", style = "font-weight: bold;", style = "margin-top: 10px;"), selectInput("dea_group2", NULL, choices = NULL), uiOutput("dea_cell_count_ui"), hr(), 
+                                          div(class = "section-header", icon("cogs"), " 5. Options"),
+                                          div(style = "background:#eef2fb; border-left:4px solid #667eea; padding:8px 10px; border-radius:4px; margin-bottom:10px; font-size:12px; color:#2c3e50;",
+                                              HTML(sprintf("<b>Significant</b> is a fixed call: <b>adj. p &lt; %.3g</b> and <b>|log2FC| &ge; %.3g</b> (= log2(1.5)). It never changes — it is the green <b>Significant</b> column and the red points / grey dashed lines on the volcano.<br><br>The two values below set a separate, <b>exploratory selected range</b> (the blue <b>In selected range</b> column and the blue dotted lines on the volcano). They do <b>not</b> change what counts as significant.",
+                                                           DEA_SIG_P_FIXED, DEA_SIG_LOGFC_FIXED))),
+                                          checkboxInput("dea_show_significant", "Show significant only (fixed cutoff)", value = FALSE),
+                                          tags$label("Selected range - Adjusted P-value:", style = "font-weight: bold;"),
+                                          info_icon("Exploratory only. Sets the 'In selected range' column and the blue dotted line on the volcano. Does NOT change the fixed Significant call."),
+                                          numericInput("dea_p_threshold", NULL,
+                                                       value = 0.05, min = 0, max = 1, step = 0.001),
+                                          helpText("Exploratory range, not the significance cutoff. Enter a value between 0 and 1."),
+                                          tags$label("Selected range - Min |log2FC|:", style = "font-weight: bold;"),
+                                          info_icon("Exploratory only. Minimum absolute log2 fold change for the 'In selected range' column and the blue dotted lines - both up- and down-regulated. Does NOT change the fixed Significant call."),
+                                          numericInput("dea_logfc_threshold", NULL,
+                                                       value = 0.585, min = 0, max = 10, step = 0.05),
+                                          helpText("Exploratory range, not the significance cutoff. Enter a value of 0 or greater."),
+                                          sliderInput("dea_volcano_height", "Volcano plot height (px):",
+                                                      min = 400, max = 1100, value = 650, step = 25),
+                                          sliderInput("dea_violin_height", "Single-gene violin height (px):",
+                                                      min = 300, max = 800, value = 500, step = 25),
+                                          hr(),
+                                          div(class = "section-header", icon("file-upload"), " 6. Restrict to a Custom Gene List (Optional)"),
+                                          tags$label("Upload a CSV or TXT file with one column of gene symbols. The volcano plot, results table, and downloads will be restricted to genes in this list. The Time Series tab's cluster export produces a compatible file."),
+                                          info_icon("Accepts a CSV with a 'gene' column or a plain text file with one gene per line. Use the Time Series tab's 'Download cluster genes' button to generate one."),
+                                          fileInput("dea_gene_upload", NULL,
+                                                    accept = c(".csv", ".txt", ".tsv"),
+                                                    buttonLabel = "Choose file...",
+                                                    placeholder = "No file uploaded"),
+                                          uiOutput("dea_custom_genes_status_ui"),
+                                          uiOutput("dea_custom_genes_clear_ui")),
                                       br(),
                                       uiOutput("dea_run_btn_ui")),
                          mainPanel(width = 9, h3(icon("chart-line"), " Analysis Results"), uiOutput("dea_status_msg"), uiOutput("dea_results_ui")))
@@ -2127,38 +2218,56 @@ ui <- navbarPage(
              sidebarPanel(width = 3,
                           # --- Data Source ---
                           div(id = "go_config_wrap",
-                          div(class = "section-header", style = "margin-top: 0;", icon("database"), " 1. Data Source"),
-                          radioButtons("go_data_source", NULL, choices = c("Use DEA Results" = "dea", "Upload gene list" = "upload"), selected = "dea", inline = TRUE),
-                          conditionalPanel(condition = "input.go_data_source == 'upload'",
-                                           fileInput("go_upload_file", "Upload your significant-gene list:", accept = c(".csv", ".tsv", ".txt")),
-                                           helpText("One gene per line, or a table with a 'gene' column. An optional fold-change column (e.g. avg_log2FC) enables the Up-vs-Down comparison.")
-                          ),
-                          conditionalPanel(condition = "input.go_data_source == 'dea'",
-                                           uiOutput("go_dea_status_ui")
-                          ),
-                          hr(),
-                          # --- Mode ---
-                          div(class = "section-header", icon("layer-group"), " 2. Analysis Mode"),
-                          radioButtons("go_mode", NULL,
-                                       choices = c("Compare Up vs Down"      = "compare",
-                                                   "All DE genes (combined)" = "all"),
-                                       selected = "compare"),
-                          helpText("'Compare' enriches the up- and down-regulated genes separately and shows them side by side. 'All DE genes (combined)' pools every DE gene into one enrichment - the only mode that detects pathways perturbed in both directions at once."),
-                          hr(),
-                          # --- Thresholds ---
-                          div(class = "section-header", icon("sliders-h"), " 3. Thresholds"),
-                          numericInput("go_p_cutoff", "Significance cutoff (adjusted p):", value = 0.05, min = 0, max = 1, step = 0.01),
-                          helpText("Enter a value between 0 and 1."),
-                          numericInput("go_logfc_cutoff", "Min |log2FC| (gene selection / up-down split):", value = 0.585, min = 0, max = 10, step = 0.1),
-                          helpText("Enter a value of 0 or greater."),
-                          numericInput("go_q_cutoff", "Q-value (FDR) cutoff:", value = 0.1, min = 0, max = 1, step = 0.01),
-                          helpText("Enter a value between 0 and 1."),
-                          hr(),
-                          # --- Ontology ---
-                          div(class = "section-header", icon("sitemap"), " 4. GO Ontology"),
-                          selectInput("go_ontology", "Ontology:", choices = c("Biological Process" = "BP", "Molecular Function" = "MF", "Cellular Component" = "CC"), selected = "BP"),
-                          helpText("Species and gene-ID type are detected automatically from your genes."),
-                          hr()),
+                              div(class = "section-header", style = "margin-top: 0;", icon("database"), " 1. Data Source"),
+                              radioButtons("go_data_source", NULL, choices = c("Use DEA Results" = "dea", "Upload gene list" = "upload"), selected = "dea", inline = TRUE),
+                              conditionalPanel(condition = "input.go_data_source == 'upload'",
+                                               fileInput("go_upload_file", "Upload your significant-gene list:", accept = c(".csv", ".tsv", ".txt")),
+                                               helpText("One gene per line, or a table with a 'gene' column. An optional fold-change column (e.g. avg_log2FC) enables the Up-vs-Down comparison.")
+                              ),
+                              conditionalPanel(condition = "input.go_data_source == 'dea'",
+                                               uiOutput("go_dea_status_ui")
+                              ),
+                              hr(),
+                              # --- Mode ---
+                              div(class = "section-header", icon("layer-group"), " 2. Analysis Mode"),
+                              radioButtons("go_mode", NULL,
+                                           choices = c("Compare Up vs Down"      = "compare",
+                                                       "All DE genes (combined)" = "all"),
+                                           selected = "compare"),
+                              helpText("'Compare' enriches the up- and down-regulated genes separately and shows them side by side. 'All DE genes (combined)' pools every DE gene into one enrichment - the only mode that detects pathways perturbed in both directions at once."),
+                              hr(),
+                              # --- Thresholds ---
+                              div(class = "section-header", icon("sliders-h"), " 3. Thresholds"),
+                              #numericInput("go_p_cutoff", "Significance cutoff (adjusted p):", value = 0.05, min = 0, max = 1, step = 0.01),
+                              #Shamim
+                              numericInput("go_p_cutoff", "Significance cutoff (adjusted p):", value = 0.05, min = 0, max = 1),
+                              helpText("Enter a value between 0 and 1."),
+                              #numericInput("go_logfc_cutoff", "Min |log2FC| (gene selection / up-down split):", value = 0.585, min = 0, max = 10, step = 0.1),
+                              #Shamim
+                              numericInput("go_logfc_cutoff", "Min |log2FC| (gene selection / up-down split):", value = 0.585, min = 0, max = 10),
+                              helpText("Enter a value of 0 or greater."),
+                              #numericInput("go_q_cutoff", "Q-value (FDR) cutoff:", value = 0.1, min = 0, max = 1, step = 0.01),
+                              #Shamim
+                              numericInput("go_q_cutoff", "Q-value (FDR) cutoff:", value = 0.1, min = 0, max = 1),
+                              helpText("Enter a value between 0 and 1."),
+                              hr(),
+                              # --- Ontology ---
+                              div(class = "section-header", icon("sitemap"), " 4. GO Ontology"),
+                              selectInput("go_ontology", "Ontology:", choices = c("Biological Process" = "BP", "Molecular Function" = "MF", "Cellular Component" = "CC"), selected = "BP"),
+                              helpText("Species and gene-ID type are detected automatically from your genes."),
+                              # hr()),
+                              # # --- Run button ---
+                              # br(),
+                              # uiOutput("go_run_btn_ui")
+                              
+                              #Shamim
+                              hr(),
+                              # --- Display options ---
+                              div(class = "section-header", icon("sliders-h"), " 5. Display Options"),
+                              sliderInput("go_top_n", "Top N terms to display:",
+                                          min = 5, max = 50, value = 15, step = 5),
+                              helpText("Number of most significant GO terms shown in the dot plot."),
+                              hr()),
                           # --- Run button ---
                           br(),
                           uiOutput("go_run_btn_ui")
@@ -2192,45 +2301,45 @@ ui <- navbarPage(
                                      selectInput("ts_col_dataset",   "Dataset / batch column (optional):", choices = NULL))
                           ),
                           div(id = "ts_config_wrap",
-                          div(class = "section-header", style = "margin-top: 0;", icon("database"), " 1. Select Dataset"),
-                          uiOutput("ts_dataset_ui"),
-                          uiOutput("ts_dataset_info_ui"),
-                          hr(),
-                          div(class = "section-header", icon("filter"), " 2. Select Cohort"),
-                          tags$label("Condition:", style = "font-weight: bold;"),
-                          info_icon("Pick a condition. If a control condition  is detected, it is automatically included on every plot for reference."),
-                          selectInput("ts_condition", NULL, choices = NULL),
-                          uiOutput("ts_control_badge_ui"),
-                          tags$label("Celltype:", style = "font-weight: bold; margin-top: 10px;"),
-                          selectInput("ts_celltype", NULL, choices = NULL),
-                          hr(),
-                          div(class = "section-header", icon("dna"), " 3. Select Gene(s)"),
-                          tags$label("Gene (single for Trend/Violin, multiple for Heatmap):", style = "font-weight: bold;"),
-                          # A sentinel "All genes (heatmap)" entry is the default selection
-                          # and is mutually exclusive with individual gene selections; the
-                          # server observer enforces the exclusion in both directions.
-                          selectizeInput("ts_gene", NULL, NULL, multiple = TRUE,
-                                         options = list(placeholder = "Type gene name(s) or keep 'All genes'...",
-                                                        loadThrottle = 500, maxOptions = 100)),
-                          tags$small(style = "color: #666;",
-                                     "Keep 'All genes (heatmap)' for a full transcriptome heatmap, ",
-                                     "or type gene names. ",
-                                     "Trend and Violin subtabs use the first selected gene."),
-                          hr(),
-                          div(class = "section-header", icon("clock"), " 4. Select Timepoints"),
-                          tags$label("Available Timepoints:", style = "font-weight: bold;"),
-                          uiOutput("ts_timepoints_ui"),
-                          hr(),
-                          div(class = "section-header", icon("ruler-vertical"), " Plot size"),
-                          sliderInput("ts_heatmap_height_override", "Heatmap height (px):",
-                                      min = 0, max = 3000, value = 400, step = 50),
-                          tags$small(style = "color: #666;",
-                                     "0 = auto-fit to gene count."),
-                          sliderInput("ts_trend_height", "Temporal Trend height (px):",
-                                      min = 400, max = 1200, value = 600, step = 25),
-                          sliderInput("ts_violin_height", "Violin Plot height (px):",
-                                      min = 400, max = 1200, value = 600, step = 25),
-                          actionButton("ts_show_plot", "Show Plot", icon = icon("eye"), class = "btn-primary", style = "width: 100%; margin-top: 15px; margin-bottom: 5px;")
+                              div(class = "section-header", style = "margin-top: 0;", icon("database"), " 1. Select Dataset"),
+                              uiOutput("ts_dataset_ui"),
+                              uiOutput("ts_dataset_info_ui"),
+                              hr(),
+                              div(class = "section-header", icon("filter"), " 2. Select Cohort"),
+                              tags$label("Condition:", style = "font-weight: bold;"),
+                              info_icon("Pick a condition. If a control condition  is detected, it is automatically included on every plot for reference."),
+                              selectInput("ts_condition", NULL, choices = NULL),
+                              uiOutput("ts_control_badge_ui"),
+                              tags$label("Celltype:", style = "font-weight: bold; margin-top: 10px;"),
+                              selectInput("ts_celltype", NULL, choices = NULL),
+                              hr(),
+                              div(class = "section-header", icon("dna"), " 3. Select Gene(s)"),
+                              tags$label("Gene (single for Trend/Violin, multiple for Heatmap):", style = "font-weight: bold;"),
+                              # A sentinel "All genes (heatmap)" entry is the default selection
+                              # and is mutually exclusive with individual gene selections; the
+                              # server observer enforces the exclusion in both directions.
+                              selectizeInput("ts_gene", NULL, NULL, multiple = TRUE,
+                                             options = list(placeholder = "Type gene name(s) or keep 'All genes'...",
+                                                            loadThrottle = 500, maxOptions = 100)),
+                              tags$small(style = "color: #666;",
+                                         "Keep 'All genes (heatmap)' for a full transcriptome heatmap, ",
+                                         "or type gene names. ",
+                                         "Trend and Violin subtabs use the first selected gene."),
+                              hr(),
+                              div(class = "section-header", icon("clock"), " 4. Select Timepoints"),
+                              tags$label("Available Timepoints:", style = "font-weight: bold;"),
+                              uiOutput("ts_timepoints_ui"),
+                              hr(),
+                              div(class = "section-header", icon("ruler-vertical"), " Plot size"),
+                              sliderInput("ts_heatmap_height_override", "Heatmap height (px):",
+                                          min = 0, max = 3000, value = 400, step = 50),
+                              tags$small(style = "color: #666;",
+                                         "0 = auto-fit to gene count."),
+                              sliderInput("ts_trend_height", "Temporal Trend height (px):",
+                                          min = 400, max = 1200, value = 600, step = 25),
+                              sliderInput("ts_violin_height", "Violin Plot height (px):",
+                                          min = 400, max = 1200, value = 600, step = 25),
+                              actionButton("ts_show_plot", "Show Plot", icon = icon("eye"), class = "btn-primary", style = "width: 100%; margin-top: 15px; margin-bottom: 5px;")
                           )
              ),
              mainPanel(width = 9,
@@ -2250,39 +2359,39 @@ ui <- navbarPage(
                        ),
                        conditionalPanel(
                          condition = "output.ts_timepoint_available == true",
-                       uiOutput("ts_summary_table_ui"),
-                       tabsetPanel(
-                         tabPanel("Heatmap", icon = icon("th"),
-                                  br(),
-                                  p(style = "color: #555;", icon("info-circle"), " Select multiple genes (or use all genes). The heatmap shows the mean expression of each gene at each timepoint. Genes are grouped by temporal expression pattern using k-means clustering on the z-scored shape of each gene's trajectory (cluster count = number of timepoints)."),
-                                  uiOutput("ts_cluster_summary_ui"),
-                                  uiOutput("ts_heatmap_plot_ui"),
-                                  br(),
-                                  uiOutput("ts_cluster_export_ui"),
-                                  uiOutput("ts_heatmap_download_ui")
-                         ),
-                         tabPanel("Temporal Trend", icon = icon("chart-line"),
-                                  br(),
-                                  p(style = "color: #555;", icon("info-circle"), " This view shows the mean expression trajectory across ordered timepoints with standard error bars. Select a single gene."),
-                                  uiOutput("ts_trend_plot_ui"),
-                                  br(),
-                                  uiOutput("ts_trend_download_ui")
-                         ),
-                         tabPanel("Boxplot", icon = icon("square"),
-                                  br(),
-                                  p(style = "color: #555;", icon("info-circle"), " Per-timepoint expression distribution as boxplots. Box = IQR, line = median, whiskers = 1.5x IQR. Select a single gene."),
-                                  uiOutput("ts_boxplot_ui"),
-                                  br(),
-                                  uiOutput("ts_boxplot_download_ui")
-                         ),
-                         tabPanel("Violin Plot", icon = icon("chart-bar"),
-                                  br(),
-                                  p(style = "color: #555;", icon("info-circle"), " Single-gene expression distribution across timepoints. Select a single gene."),
-                                  uiOutput("ts_plot_ui"),
-                                  br(),
-                                  uiOutput("ts_download_ui")
+                         uiOutput("ts_summary_table_ui"),
+                         tabsetPanel(
+                           tabPanel("Heatmap", icon = icon("th"),
+                                    br(),
+                                    p(style = "color: #555;", icon("info-circle"), " Select multiple genes (or use all genes). The heatmap shows the mean expression of each gene at each timepoint. Genes are grouped by temporal expression pattern using k-means clustering on the z-scored shape of each gene's trajectory (cluster count = number of timepoints)."),
+                                    uiOutput("ts_cluster_summary_ui"),
+                                    uiOutput("ts_heatmap_plot_ui"),
+                                    br(),
+                                    uiOutput("ts_cluster_export_ui"),
+                                    uiOutput("ts_heatmap_download_ui")
+                           ),
+                           tabPanel("Temporal Trend", icon = icon("chart-line"),
+                                    br(),
+                                    p(style = "color: #555;", icon("info-circle"), " This view shows the mean expression trajectory across ordered timepoints with standard error bars. Select a single gene."),
+                                    uiOutput("ts_trend_plot_ui"),
+                                    br(),
+                                    uiOutput("ts_trend_download_ui")
+                           ),
+                           tabPanel("Boxplot", icon = icon("square"),
+                                    br(),
+                                    p(style = "color: #555;", icon("info-circle"), " Per-timepoint expression distribution as boxplots. Box = IQR, line = median, whiskers = 1.5x IQR. Select a single gene."),
+                                    uiOutput("ts_boxplot_ui"),
+                                    br(),
+                                    uiOutput("ts_boxplot_download_ui")
+                           ),
+                           tabPanel("Violin Plot", icon = icon("chart-bar"),
+                                    br(),
+                                    p(style = "color: #555;", icon("info-circle"), " Single-gene expression distribution across timepoints. Select a single gene."),
+                                    uiOutput("ts_plot_ui"),
+                                    br(),
+                                    uiOutput("ts_download_ui")
+                           )
                          )
-                       )
                        )
              )
            )
@@ -2316,7 +2425,8 @@ server <- function(input, output, session) {
     global_plot_data = NULL, # Cached DF for plotting (Embeddings + Metadata)
     analysis_res = NULL, analysis_meta = NULL, active_filters = list(), error_msg = NULL, is_analyzing = FALSE,
     cocoa_gene_used = NULL, cocoa_filters_used = NULL, 
-    dea_results = NULL, dea_error_msg = NULL, dea_filter_list = list(), dea_is_analyzing = FALSE,
+    #dea_results = NULL, dea_error_msg = NULL, dea_filter_list = list(), dea_is_analyzing = FALSE,
+    dea_results = NULL, dea_error_msg = NULL, dea_filter_list = list(), dea_is_analyzing = FALSE, dea_tested_genes = NULL,#Shamim
     dea_filters_used = NULL, dea_meta_used = NULL, # Add these for plot isolation
     # Custom gene list uploaded into the DEA tab. When non-NULL the volcano
     # plot, results table, and downloads are restricted to these genes. The
@@ -2425,7 +2535,9 @@ server <- function(input, output, session) {
     }
   })
   
-  observe({ 
+  #observe({ 
+  #Shamim
+  observeEvent(vals$data, { 
     req(vals$data); 
     
     # Pre-calculate global plot data for speed
@@ -2579,7 +2691,8 @@ server <- function(input, output, session) {
   
   render_gene_info <- function(gene, data) {
     if (gene == "" || is.null(gene) || !(gene %in% rownames(data))) return(NULL)
-    expr <- GetAssayData(data, layer = "data")[gene, ]
+   # expr <- GetAssayData(data, layer = "data")[gene, ]
+    expr <- get_expr_row(gene)    # uses session cache instead of re-extracting #Shamim
     n_cells <- sum(expr > 0)
     div(class = "gene-info-box", p(icon("check-circle", style = "color: green;"), strong("Selected")), p(style = "margin: 3px 0;", paste0("• Expressing Cells: ", format(n_cells, big.mark=",")))) 
   }
@@ -2617,8 +2730,15 @@ server <- function(input, output, session) {
     # Apply the Show/Hide Groups checkbox set, if present (Metadata UMAP subtab).
     if (!is.null(input$explore_filter_meta_groups) && !is.null(input$explore_filter_meta_col)) {
       all_groups <- sort(unique(as.character(vals$data@meta.data[[input$explore_filter_meta_col]])))
-      if (length(input$explore_filter_meta_groups) < length(all_groups)) {
-        cell_mask  <- cell_mask & (vals$data@meta.data[[input$explore_filter_meta_col]] %in% input$explore_filter_meta_groups)
+      # Intersect the selection with the CURRENT column's groups. When the
+      # "Color left UMAP by" column has just changed, input$explore_filter_meta_groups
+      # still carries the PREVIOUS column's labels for one reactive flush; matching
+      # those foreign labels against the new column yields zero cells and used to
+      # fire a spurious "no cells match" notification + fall back to the full view.
+      # Treating stale labels as "no selection made yet" makes it a no-op instead.
+      sel <- intersect(input$explore_filter_meta_groups, all_groups)
+      if (length(sel) > 0 && length(sel) < length(all_groups)) {
+        cell_mask  <- cell_mask & (vals$data@meta.data[[input$explore_filter_meta_col]] %in% sel)
         has_filter <- TRUE
       }
     }
@@ -2660,14 +2780,14 @@ server <- function(input, output, session) {
       dataset   = if (isTruthy(input$ts_col_dataset))   input$ts_col_dataset   else NULL
     )
   })
-
+  
   # Expose timepoint availability to the UI so the Time Series main panel can
   # swap between the analysis tabs and an explanatory "not available" message
   # via conditionalPanel. suspendWhenHidden = FALSE keeps it evaluated even
   # while the message branch (which itself references it) is the visible one.
   output$ts_timepoint_available <- reactive({ isTRUE(vals$ts_timepoint_available) })
   outputOptions(output, "ts_timepoint_available", suspendWhenHidden = FALSE)
-
+  
   # Freeze the Time Series sidebar controls when no timepoint column exists.
   observe({
     if (isTRUE(vals$ts_timepoint_available)) {
@@ -2952,6 +3072,32 @@ server <- function(input, output, session) {
   # rendered, and (d) geom_tile vs geom_raster (raster is a single bitmap
   # so it scales to tens of thousands of rows without ggplot emitting one
   # polygon per cell).
+  
+  #Shamim
+  # Shared time series data slice — computed once, reused by all 4 TS plots.
+  ts_data_slice <- reactive({
+    req(vals$data, vals$ts_active_condition, vals$ts_active_celltype, vals$ts_active_tps)
+    r <- vals$ts_active_roles %||% ts_roles()
+    req(!is.null(r$timepoint), !is.null(r$condition), !is.null(r$celltype))
+    meta    <- vals$data@meta.data
+    
+    ds_mask <- ts_dataset_filter()
+    ds_conds <- unique(as.character(meta[[r$condition]][ds_mask]))
+    ctrl <- detect_control_conditions(ds_conds)
+    conditions_use <- unique(c(vals$ts_active_condition, ctrl))
+    mask <- ds_mask &
+      meta[[r$condition]] %in% conditions_use &
+      meta[[r$celltype]]  == vals$ts_active_celltype &
+      meta[[r$timepoint]] %in% vals$ts_active_tps
+    if (sum(mask) == 0) return(NULL)
+    list(
+      sub_obj        = vals$data[, mask],
+      conditions_use = conditions_use,
+      r              = r
+    )
+  })
+  
+  
   ts_heatmap_logic <- reactive({
     req(vals$data, vals$ts_active_condition, vals$ts_active_celltype, vals$ts_active_tps)
     r <- vals$ts_active_roles %||% ts_roles()
@@ -2969,21 +3115,28 @@ server <- function(input, output, session) {
     # alongside the user-selected condition. The control reference is
     # required for time-course interpretation of treatment-induced
     # trajectories.
-    ds_mask <- ts_dataset_filter()
-    ds_conditions <- unique(as.character(meta[[r$condition]][ds_mask]))
-    ctrl <- detect_control_conditions(ds_conditions)
-    conditions_to_use <- vals$ts_active_condition
-    if (length(ctrl) > 0 && !ctrl[1] %in% conditions_to_use) {
-      conditions_to_use <- c(ctrl[1], conditions_to_use)
-    }
+    #Shamim
+    # ds_mask <- ts_dataset_filter()
+    # ds_conditions <- unique(as.character(meta[[r$condition]][ds_mask]))
+    # ctrl <- detect_control_conditions(ds_conditions)
+    # conditions_to_use <- vals$ts_active_condition
+    # if (length(ctrl) > 0 && !ctrl[1] %in% conditions_to_use) {
+    #   conditions_to_use <- c(ctrl[1], conditions_to_use)
+    # }
+    # 
+    # mask <- ds_mask &
+    #   meta[[r$condition]] %in% conditions_to_use &
+    #   meta[[r$celltype]]  == vals$ts_active_celltype &
+    #   meta[[r$timepoint]] %in% vals$ts_active_tps
+    # if (sum(mask) == 0) return(NULL)
+    # 
+    # sub_obj <- vals$data[, mask]
     
-    mask <- ds_mask &
-      meta[[r$condition]] %in% conditions_to_use &
-      meta[[r$celltype]]  == vals$ts_active_celltype &
-      meta[[r$timepoint]] %in% vals$ts_active_tps
-    if (sum(mask) == 0) return(NULL)
-    
-    sub_obj <- vals$data[, mask]
+    #Shamim
+    slice <- ts_data_slice(); req(slice)
+    sub_obj <- slice$sub_obj
+    conditions_to_use <- slice$conditions_use
+    r <- slice$r
     
     # All-genes mode takes every gene present in the matrix; otherwise the
     # user-typed list, filtered to names that exist in the dataset.
@@ -3315,17 +3468,22 @@ server <- function(input, output, session) {
     # Always include the auto-detected control condition alongside the
     # user-selected condition so the treatment trajectory has a reference.
     meta <- vals$data@meta.data
-    ds_mask <- ts_dataset_filter()
-    ds_conds <- unique(as.character(meta[[r$condition]][ds_mask]))
-    ctrl <- detect_control_conditions(ds_conds)
-    conditions_use <- unique(c(vals$ts_active_condition, ctrl))
-    mask <- ds_mask &
-      meta[[r$condition]] %in% conditions_use &
-      meta[[r$celltype]]  == vals$ts_active_celltype &
-      meta[[r$timepoint]] %in% vals$ts_active_tps
-    if (sum(mask) == 0) return(NULL)
-    
-    sub_obj <- vals$data[, mask]
+    # ds_mask <- ts_dataset_filter()
+    # ds_conds <- unique(as.character(meta[[r$condition]][ds_mask]))
+    # ctrl <- detect_control_conditions(ds_conds)
+    # conditions_use <- unique(c(vals$ts_active_condition, ctrl))
+    # mask <- ds_mask &
+    #   meta[[r$condition]] %in% conditions_use &
+    #   meta[[r$celltype]]  == vals$ts_active_celltype &
+    #   meta[[r$timepoint]] %in% vals$ts_active_tps
+    # if (sum(mask) == 0) return(NULL)
+    # 
+    # sub_obj <- vals$data[, mask]
+    #Shamim
+    slice <- ts_data_slice(); req(slice)
+    sub_obj        <- slice$sub_obj
+    conditions_to_use <- slice$conditions_use
+    r  <- slice$r
     gene1 <- vals$ts_active_gene[1]
     expr  <- GetAssayData(sub_obj, layer = "data")[gene1, ]
     cond_vec <- as.character(sub_obj@meta.data[[r$condition]])
@@ -3377,16 +3535,23 @@ server <- function(input, output, session) {
     
     meta <- vals$data@meta.data
     ds_mask <- ts_dataset_filter()
-    ds_conds <- unique(as.character(meta[[r$condition]][ds_mask]))
-    ctrl <- detect_control_conditions(ds_conds)
-    conditions_use <- unique(c(vals$ts_active_condition, ctrl))
-    mask <- ds_mask &
-      meta[[r$condition]] %in% conditions_use &
-      meta[[r$celltype]]  == vals$ts_active_celltype &
-      meta[[r$timepoint]] %in% vals$ts_active_tps
-    if (sum(mask) == 0) return(NULL)
+    #Shamim
+    # ds_conds <- unique(as.character(meta[[r$condition]][ds_mask]))
+    # ctrl <- detect_control_conditions(ds_conds)
+    # conditions_use <- unique(c(vals$ts_active_condition, ctrl))
+    # mask <- ds_mask &
+    #   meta[[r$condition]] %in% conditions_use &
+    #   meta[[r$celltype]]  == vals$ts_active_celltype &
+    #   meta[[r$timepoint]] %in% vals$ts_active_tps
+    # if (sum(mask) == 0) return(NULL)
+    # 
+    # sub_obj <- vals$data[, mask]
+    slice <- ts_data_slice(); req(slice)
+    sub_obj <- slice$sub_obj
+    conditions_to_use <- slice$conditions_use
+    r <- slice$r
     
-    sub_obj <- vals$data[, mask]
+    
     gene1 <- vals$ts_active_gene[1]
     expr  <- as.numeric(GetAssayData(sub_obj, layer = "data")[gene1, ])
     cond_vec <- as.character(sub_obj@meta.data[[r$condition]])
@@ -3463,17 +3628,23 @@ server <- function(input, output, session) {
     req(!is.null(r$timepoint), !is.null(r$condition), !is.null(r$celltype))
     
     meta <- vals$data@meta.data
-    ds_mask <- ts_dataset_filter()
-    ds_conds <- unique(as.character(meta[[r$condition]][ds_mask]))
-    ctrl <- detect_control_conditions(ds_conds)
-    conditions_use <- unique(c(vals$ts_active_condition, ctrl))
-    mask <- ds_mask &
-      meta[[r$condition]] %in% conditions_use &
-      meta[[r$celltype]]  == vals$ts_active_celltype &
-      meta[[r$timepoint]] %in% vals$ts_active_tps
-    if (sum(mask) == 0) return(NULL)
+    # ds_mask <- ts_dataset_filter()
+    # ds_conds <- unique(as.character(meta[[r$condition]][ds_mask]))
+    # ctrl <- detect_control_conditions(ds_conds)
+    # conditions_use <- unique(c(vals$ts_active_condition, ctrl))
+    # mask <- ds_mask &
+    #   meta[[r$condition]] %in% conditions_use &
+    #   meta[[r$celltype]]  == vals$ts_active_celltype &
+    #   meta[[r$timepoint]] %in% vals$ts_active_tps
+    # if (sum(mask) == 0) return(NULL)
+    # 
+    # sub_obj <- vals$data[, mask]
+    #Shamim
+    slice <- ts_data_slice(); req(slice)
+    sub_obj <- slice$sub_obj
+    conditions_to_use <- slice$conditions_use
+    r <- slice$r
     
-    sub_obj <- vals$data[, mask]
     expr <- as.numeric(GetAssayData(sub_obj, layer = "data")[vals$ts_active_gene[1], ])
     cond_vec <- as.character(sub_obj@meta.data[[r$condition]])
     df <- data.frame(
@@ -3570,7 +3741,7 @@ server <- function(input, output, session) {
     explore_zoom_xlim(NULL)
     explore_zoom_ylim(NULL)
   })
-
+  
   # Snapshot the UMAP settings when the user clicks "Show Plot".
   # This isolates the plots from reactive filter changes until the button
   # is pressed again, matching the UX of the other subtabs.
@@ -3582,7 +3753,7 @@ server <- function(input, output, session) {
       subtitle = vals$explore_active_subtitle
     )
   }, ignoreNULL = FALSE)
-
+  
   # --- Memoized expression-row extraction --------------------------------
   # Pulling one gene's row out of the sparse 'data' layer for ~100k cells is the
   # dominant per-render cost on the UMAP / coexpression tabs. Cache the full row
@@ -3597,13 +3768,18 @@ server <- function(input, output, session) {
     hit <- expr_row_cache[[key]]
     if (!is.null(hit)) return(hit)
     row <- GetAssayData(vals$data, layer = "data")[gene, ]
+    # if (length(ls(expr_row_cache, all.names = TRUE)) >= 16L) {
+    #   rm(list = ls(expr_row_cache, all.names = TRUE), envir = expr_row_cache)
+    # }
+    #Shamim
     if (length(ls(expr_row_cache, all.names = TRUE)) >= 16L) {
-      rm(list = ls(expr_row_cache, all.names = TRUE), envir = expr_row_cache)
+      oldest <- ls(expr_row_cache, all.names = TRUE)[1]
+      rm(list = oldest, envir = expr_row_cache)
     }
     assign(key, row, envir = expr_row_cache)
     row
   }
-
+  
   # plotOutput(width = "100%") collapses to ~0 px whenever its tab is hidden or
   # the layout is mid-reflow (e.g. dataset_status_ui re-rendering to add the
   # gene-id toggle after a biomaRt conversion, or a plain tab switch). On the
@@ -3616,7 +3792,7 @@ server <- function(input, output, session) {
     w <- session$clientData[[paste0("output_", output_id, "_width")]]
     if (is.null(w) || !is.finite(w) || w < min_px) min_px else as.integer(w)
   }
-
+  
   output$explore_umap_meta <- renderPlot({
     # Do not render on startup: a 100k-cell UMAP costs a few seconds, so we wait
     # for an explicit click on "Show Plot" and show a prompt until then.
@@ -3625,22 +3801,22 @@ server <- function(input, output, session) {
     }
     snap <- umap_snapshot()
     req(vals$global_plot_data, snap$meta_col)
-
+    
     # Subset global DF (FAST)
     umap_df <- if (!is.null(snap$mask)) vals$global_plot_data[snap$mask, ] else vals$global_plot_data
-
+    
     # droplevels() so only the cell types actually present in the current
     # (filtered) view are coloured. A metadata factor copied from meta.data
     # keeps every original level; without dropping, the palette is sized/shifted
     # against levels that aren't plotted and stops matching the legend below.
     group_data <- droplevels(as.factor(umap_df[[snap$meta_col]]))
     umap_df$group <- group_data
-
+    
     groups <- levels(group_data)
     # Named palette keyed by level so the plot, the CSS legend below, and the
     # PNG export all map a given category to the exact same colour.
     my_palette <- setNames(get_expanded_palette(length(groups)), groups)
-
+    
     # The in-plot legend is suppressed here: with many cell-type levels it
     # used to overflow the image border or shrink the plotting panel to an
     # awkward non-square. The full categorical legend is rendered separately
@@ -3654,15 +3830,16 @@ server <- function(input, output, session) {
       theme_minimal(base_size = 14) +
       labs(title = paste("By", snap$meta_col), subtitle = snap$subtitle) +
       theme(legend.position = "none")
-
+    
     if (!is.null(explore_zoom_xlim()) && !is.null(explore_zoom_ylim())) {
       p <- p + coord_cartesian(xlim = explore_zoom_xlim(), ylim = explore_zoom_ylim())
     }
     p
-  }, res = 110,
-     width = function() safe_plot_width("explore_umap_meta"),
-     height = function() input$explore_umap_height %||% 1000)
-
+ # }, res = 110,
+   }, res = 72,
+  width = function() safe_plot_width("explore_umap_meta"),
+  height = function() input$explore_umap_height %||% 1000)
+  
   # Separate full-width metadata legend. Mirrors the metadata UMAP exactly:
   # same factor-level order (the order ggplot uses to map colours), same
   # palette from get_expanded_palette(). Rendered as a CSS grid so the
@@ -3702,7 +3879,7 @@ server <- function(input, output, session) {
               div(style = "display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 8px;",
                   chips))
   })
-
+  
   output$explore_umap_expr <- renderPlot({
     if (is.null(input$show_umap_plot) || input$show_umap_plot == 0) {
       return(placeholder_plot("Click \"Show Plot\" to render the expression UMAP."))
@@ -3718,7 +3895,7 @@ server <- function(input, output, session) {
     
     # Fetch expression data for ALL cells (memoized - see get_expr_row)
     expr_all <- get_expr_row(snap$gene)
-
+    
     # Subset if mask exists
     if (!is.null(snap$mask)) {
       umap_df <- vals$global_plot_data[snap$mask, ]
@@ -3727,24 +3904,25 @@ server <- function(input, output, session) {
       umap_df <- vals$global_plot_data
       expr <- expr_all
     }
-
+    
     umap_df$expr <- expr
     umap_df <- umap_df %>% arrange(expr)
-
+    
     p <- ggplot(umap_df, aes(x=UMAP_1, y=UMAP_2, color=expr)) +
       umap_point_layer(size=1.5, alpha=0.9, na.rm = TRUE, raster.dpi = SCREEN_RASTER_DPI) +
       scale_color_expression(name = "Expression") +
       theme_minimal(base_size = 14) +
       labs(title = paste("Gene:", snap$gene))
-
+    
     if (!is.null(explore_zoom_xlim()) && !is.null(explore_zoom_ylim())) {
       p <- p + coord_cartesian(xlim = explore_zoom_xlim(), ylim = explore_zoom_ylim())
     }
     p
-  }, res = 110,
-     width = function() safe_plot_width("explore_umap_expr"),
-     height = function() input$explore_umap_height %||% 1000)
-
+ # }, res = 110,
+  }, res = 72,
+  width = function() safe_plot_width("explore_umap_expr"),
+  height = function() input$explore_umap_height %||% 1000)
+  
   # === CLICK METADATA LOGIC ===
   last_explore_click <- reactiveVal(NULL)
   
@@ -3815,8 +3993,8 @@ server <- function(input, output, session) {
       # than one giant single column. Numbers tuned for the wide export
       # canvas below.
       legend_ncol <- if (n_groups <= 8) n_groups
-                     else if (n_groups <= 30) 5L
-                     else 7L
+      else if (n_groups <= 30) 5L
+      else 7L
       n_rows <- as.integer(ceiling(n_groups / legend_ncol))
       p <- ggplot(umap_df, aes(x = UMAP_1, y = UMAP_2, color = group)) +
         umap_point_layer(size = 1.8, alpha = 0.9, raster.dpi = 400) +
@@ -3905,7 +4083,7 @@ server <- function(input, output, session) {
     }
     if (!is.finite(m) || m <= 0) NULL else c(0, m)
   }
-
+  
   # raster_dpi defaults low (150) for the on-screen device - rasterising 100k
   # points at 300 dpi supersamples a ~110 dpi screen and is actually slower than
   # drawing fewer pixels. Downloads pass 300 to match their ggsave dpi.
@@ -3932,7 +4110,7 @@ server <- function(input, output, session) {
     }
     build_expression_umap(df, gene, expr, limits = limits, raster_dpi = raster_dpi)
   }
-
+  
   # Snapshot the coexpression request on each Show Plot click, but only redraw
   # when it actually differs from what is on screen. observeEvent fires on every
   # click even with identical inputs (which made re-clicking the same genes pay
@@ -3952,22 +4130,22 @@ server <- function(input, output, session) {
     coexp_snapshot(list(gene_a = ga, gene_b = gb, mask = mask,
                         limits = coexp_shared_limits(mask = mask)))
   }, ignoreInit = TRUE)
-
+  
   output$coexp_umap_g1 <- renderPlot({
     snap <- coexp_snapshot()
     if (is.null(snap)) return(placeholder_plot("Click \"Show Plot\" to render the co-expression UMAPs."))
     coexp_gene_plot(snap$gene_a, limits = snap$limits, mask = snap$mask, raster_dpi = SCREEN_RASTER_DPI)
   }, res = 110,
-     width = function() safe_plot_width("coexp_umap_g1"),
-     height = function() input$coexp_plot_height %||% 1000)
+  width = function() safe_plot_width("coexp_umap_g1"),
+  height = function() input$coexp_plot_height %||% 1000)
   output$coexp_umap_g2 <- renderPlot({
     snap <- coexp_snapshot()
     if (is.null(snap)) return(placeholder_plot("Click \"Show Plot\" to render the co-expression UMAPs."))
     coexp_gene_plot(snap$gene_b, limits = snap$limits, mask = snap$mask, raster_dpi = SCREEN_RASTER_DPI)
   }, res = 110,
-     width = function() safe_plot_width("coexp_umap_g2"),
-     height = function() input$coexp_plot_height %||% 1000)
-
+  width = function() safe_plot_width("coexp_umap_g2"),
+  height = function() input$coexp_plot_height %||% 1000)
+  
   output$coexp_g1_download <- downloadHandler(
     filename = function() paste0("coexp_", isolate(input$coexp_gene_a %||% "gene1"), ".png"),
     content  = function(file) {
@@ -4082,7 +4260,7 @@ server <- function(input, output, session) {
   output$qc_violin_nFeature_ui  <- renderUI(withSpinner(plotOutput("qc_violin_nFeature",  height = paste0(input$qc_plot_height %||% 550, "px")), type = 6, color = "#27ae60"))
   output$qc_violin_nCount_ui    <- renderUI(withSpinner(plotOutput("qc_violin_nCount",    height = paste0(input$qc_plot_height %||% 550, "px")), type = 6, color = "#27ae60"))
   output$qc_violin_percentMt_ui <- renderUI(withSpinner(plotOutput("qc_violin_percentMt", height = paste0(input$qc_plot_height %||% 550, "px")), type = 6, color = "#27ae60"))
-
+  
   output$qc_violin_nFeature  <- renderPlot({
     req(input$show_qc_plot, input$show_qc_plot > 0)
     isolate(qc_plot_for("nFeature_RNA"))
@@ -4151,7 +4329,7 @@ server <- function(input, output, session) {
         # restore it.
         return(div(class = "error-box", style = "margin-bottom: 10px;",
                    icon("exclamation-circle"),
-                   " This dataset has EnsemblIDs, but biomaRt is not installed",
+                   " This dataset uses Ensembl gene IDs, but biomaRt is not installed",
                    " in this R environment, so they cannot be converted to the gene",
                    " symbols geneCOCOA needs. Install Bioconductor's biomaRt and",
                    " restart AtlasLens."))
@@ -4159,8 +4337,8 @@ server <- function(input, output, session) {
       return(div(
         div(class = "error-box", style = "margin-bottom: 10px;",
             icon("exclamation-circle"),
-            " This dataset has Ensembl IDs,but geneCOCOA works with gene symbols",
-            " Please convert IDs to symbols first.",
+            " This dataset uses Ensembl gene IDs. geneCOCOA needs gene symbols",
+            " (its pathway gene sets are symbol-based) - convert them first."),
         actionButton("cocoa_convert_ensembl", "Convert gene IDs to symbols",
                      class = "btn-info btn-block btn-lg", icon = icon("dna"),
                      style = "font-weight: bold;",
@@ -4191,7 +4369,7 @@ server <- function(input, output, session) {
       actionButton("run_analysis", "Run geneCOCOA Analysis", class = "btn-primary btn-block btn-lg", icon = icon("play-circle"), style = "font-weight: bold; padding: 12px;")
     }
   })
-
+  
   # Freeze the COCOA sidebar config in two situations: (1) the dataset uses
   # Ensembl gene IDs and must be converted to symbols first - the conversion
   # button lives outside this wrapper (in run_btn_ui), so the user is funnelled
@@ -4225,7 +4403,7 @@ server <- function(input, output, session) {
     # run_btn_ui swaps to the disabled "Converting..." button on the next flush.
     showNotification("Mapping Ensembl IDs to gene symbols using the local annotation database (Ensembl BioMart is only contacted if needed)...",
                      id = "cocoa_convert_msg", type = "message", duration = NULL)
-
+    
     # Heads-up so users know the conversion is reversible: once it finishes, the
     # Introduction tab shows a toggle to flip the displayed identifiers back and
     # forth between gene symbols and Ensembl IDs.
@@ -4234,7 +4412,7 @@ server <- function(input, output, session) {
       "Converting gene IDs to symbols. Once it finishes, you can switch between gene symbols and Ensembl IDs at any time using the \"Displayed gene identifiers\" toggle in the Introduction tab.",
       easyClose = TRUE, footer = modalButton("Got it")
     ))
-
+    
     future({
       map_ensembl_to_symbol(unique(ens_keys), species)
     }, globals = list(map_ensembl_to_symbol = map_ensembl_to_symbol,
@@ -4280,7 +4458,7 @@ server <- function(input, output, session) {
       removeNotification("cocoa_convert_msg")
     })
   })
-
+  
   # Gene-identifier toggle (item 5): flip the active object between the cached
   # gene-symbol and Ensembl-ID representations produced by the biomaRt
   # conversion. Swapping vals$data triggers the on-load observer that rebuilds
@@ -4308,7 +4486,7 @@ server <- function(input, output, session) {
     # a "gene not in dataset" panel.
     coexp_snapshot(NULL)
   }, ignoreInit = TRUE)
-
+  
   observeEvent(input$run_analysis, {
     req(input$analysis_gene, input$analysis_groups, !vals$is_analyzing)
     
@@ -4456,21 +4634,21 @@ server <- function(input, output, session) {
   })
   output$analysis_plot <- renderPlot({ req(vals$analysis_res); gene_to_show <- if(!is.null(vals$cocoa_gene_used)) vals$cocoa_gene_used else "Unknown"; filters_to_show <- if(!is.null(vals$cocoa_filters_used)) vals$cocoa_filters_used else list(); res <- vals$analysis_res; plot_df <- bind_rows(lapply(names(res), function(g) { d <- res[[g]]; if(is.null(d)) return(NULL); d <- as.data.frame(d); if(!("geneset" %in% colnames(d))) d$geneset <- rownames(d); tibble(Pathway = gsub("HALLMARK_", "", d$geneset), PVal = if("p.adj" %in% colnames(d)) d$p.adj else d$p, NLP = -log10(PVal), Group = g) })); if (nrow(plot_df) == 0) { plot.new(); text(0.5, 0.5, "No significant pathways.", cex = 1.5); return() }; plot_df_filtered <- plot_df %>% filter(PVal < input$p_val_thresh); if (nrow(plot_df_filtered) == 0) { plot.new(); text(0.5, 0.5, "No pathways below P-value threshold.", cex = 1.5); return() }; filter_str <- "Global Filters: None"; if (length(filters_to_show) > 0) { f_parts <- sapply(filters_to_show, function(f) { val_str <- paste(head(f$vals, 2), collapse=","); if(length(f$vals)>2) val_str <- paste0(val_str, "..."); paste0(f$col, "=(", val_str, ")") }); filter_str <- paste("Global Filters:", paste(f_parts, collapse="; ")) }; ggplot(plot_df_filtered, aes(x = NLP, y = reorder(Pathway, NLP), fill = Group)) + geom_col(position = position_dodge(width = 0.8), width = 0.7, alpha = 0.8) + scale_fill_brewer(palette = "Set2") + labs(title = paste("Co-regulation:", gene_to_show), subtitle = paste0("Comparison: ", vals$analysis_meta$col, "\n", filter_str), x = "-log10(Adjusted P-Value)", y = NULL) + theme_minimal(base_size = 14) + theme(plot.title = element_text(face = "bold", size = 18), legend.position = "bottom") }, height = 800)
   #output$download_analysis <- downloadHandler(filename = function() paste0("cocoa_", input$analysis_gene, ".png"), content = function(file) ggsave(file, width = 12, height = 9))
-   #adding plot argument
-   output$download_analysis <- downloadHandler(
-  filename = function() paste0("cocoa_", input$analysis_gene, ".png"),
-  content = function(file) {
-    req(vals$analysis_res)
-    # Re-render the plot explicitly rather than relying on last_plot()
-    p <- isolate({
-      # same plot logic as output$analysis_plot
-      # ideally extract to a reactive or named function
-    })
-    ggsave(file, plot = p, width = 12, height = 9, dpi = 300)
-  }
-)                                                                                                                                                                                                                                                                                                                                 
-                                                                                                                                                                                                                                                                                                                                    
-                                                                                                                                                                                                                                                                                                                                    
+  #adding plot argument
+  output$download_analysis <- downloadHandler(
+    filename = function() paste0("cocoa_", input$analysis_gene, ".png"),
+    content = function(file) {
+      req(vals$analysis_res)
+      # Re-render the plot explicitly rather than relying on last_plot()
+      p <- isolate({
+        # same plot logic as output$analysis_plot
+        # ideally extract to a reactive or named function
+      })
+      ggsave(file, plot = p, width = 12, height = 9, dpi = 300)
+    }
+  )                                                                                                                                                                                                                                                                                                                                 
+  
+  
   output$download_analysis_script <- downloadHandler(
     filename = function() paste0("atlaslens_cocoa_", input$analysis_gene %||% "gene", "_reproduce.R"),
     content  = function(file) {
@@ -4503,7 +4681,7 @@ server <- function(input, output, session) {
       if (vals$dea_history_pending$g1 %in% available_groups && vals$dea_history_pending$g2 %in% available_groups) {
         selected_g1 <- vals$dea_history_pending$g1
         selected_g2 <- vals$dea_history_pending$g2
-       vals$dea_history_pending <- NULL # Reset when fully applied
+        vals$dea_history_pending <- NULL # Reset when fully applied
       } else {
         selected_g1 <- vals$dea_history_pending$g1
         selected_g2 <- vals$dea_history_pending$g2
@@ -4533,7 +4711,7 @@ server <- function(input, output, session) {
       actionButton("dea_run_analysis", "Run Differential Analysis", class = "btn-primary btn-block btn-lg", icon = icon("play-circle"), style = "font-weight: bold;")
     }
   })
-
+  
   # Freeze every DEA sidebar control (filters, group pickers, thresholds,
   # upload) while an analysis is running so the run cannot be reconfigured
   # mid-flight. The run button itself already shows a disabled "Processing..."
@@ -4568,7 +4746,9 @@ server <- function(input, output, session) {
     future({
       run_dea_worker(subset_counts, subset_meta, meta_col, group1, group2) 
     }, globals=list(run_dea_worker=run_dea_worker, subset_counts=subset_counts, subset_meta=subset_meta, group1=group1, group2=group2, meta_col=meta_col), packages = c("Seurat", "presto", "Matrix"), seed = TRUE) %...>% (function(res) {
-      if (!is.null(res) && nrow(res) > 0) { vals$dea_results <- res; vals$dea_filters_used <- filters; vals$dea_meta_used <- list(col=meta_col, g1=group1, g2=group2); save_dea_cache(hash_in, res, filters, list(col=meta_col, groups=c(group1, group2)), gene_in) } else { vals$dea_error_msg <- "No results returned." }
+      if (!is.null(res) && nrow(res) > 0) { vals$dea_results <- res;  vals$dea_tested_genes <- res$gene ; vals$dea_filters_used <- filters; vals$dea_meta_used <- list(col=meta_col, g1=group1, g2=group2); save_dea_cache(hash_in, res, filters, list(col=meta_col, groups=c(group1, group2)), gene_in) } else {
+        vals$dea_error_msg <- "No results returned."
+      }
     }) %...!% (function(err) { vals$dea_error_msg <- paste("Async Error:", err$message) }) %>% finally(function() {
       vals$dea_is_analyzing <- FALSE; session$sendCustomMessage("stop_timer", list()); shinyjs::hide("dea_loading_overlay")
     })
@@ -4727,15 +4907,31 @@ server <- function(input, output, session) {
     req(fr)
     validate(need(nrow(fr) > 0,
                   "None of the uploaded genes match the DEA results."))
+    # Two independent calls per gene:
+    #   * Significant         -> the FIXED, paper-defined cutoff (never changes).
+    #   * In selected range   -> the user's sidebar adj-p / min|log2FC| values.
     p_thr  <- input$dea_p_threshold     %||% 0.05
     fc_thr <- input$dea_logfc_threshold %||% 0.585
     raw <- fr
+
+    fixed_mask <- !is.na(raw$p_val_adj) & raw$p_val_adj < DEA_SIG_P_FIXED &
+      !is.na(raw$avg_log2FC) & abs(raw$avg_log2FC) >= DEA_SIG_LOGFC_FIXED
+    range_mask <- !is.na(raw$p_val_adj) & raw$p_val_adj < p_thr &
+      !is.na(raw$avg_log2FC) & abs(raw$avg_log2FC) >= fc_thr
+
+    # The "Show significant only" checkbox filters to the FIXED significant set,
+    # keeping it consistent with the paper-defined Significant column.
     if (isTRUE(input$dea_show_significant)) {
-      sig_mask <- !is.na(raw$p_val_adj) & raw$p_val_adj < p_thr &
-        !is.na(raw$avg_log2FC) & abs(raw$avg_log2FC) >= fc_thr
-      raw <- raw[sig_mask, , drop = FALSE]
+      keep       <- fixed_mask
+      raw        <- raw[keep, , drop = FALSE]
+      fixed_mask <- fixed_mask[keep]
+      range_mask <- range_mask[keep]
     }
-    raw <- raw[order(raw$p_val_adj, na.last = TRUE), , drop = FALSE]
+
+    ord <- order(raw$p_val_adj, na.last = TRUE)
+    raw <- raw[ord, , drop = FALSE]
+    fixed_keep <- fixed_mask[ord]
+    range_keep <- range_mask[ord]
     table_df <- data.frame(
       gene       = raw$gene,
       avg_log2FC = round(raw$avg_log2FC, 4),
@@ -4743,9 +4939,9 @@ server <- function(input, output, session) {
       p_val_adj  = formatC(raw$p_val_adj, format = "e", digits = 2),
       pct.1      = round(raw$pct.1, 3),
       pct.2      = round(raw$pct.2, 3),
-      Significant = ifelse(!is.na(raw$p_val_adj) & raw$p_val_adj < p_thr &
-                             !is.na(raw$avg_log2FC) & abs(raw$avg_log2FC) >= fc_thr,
-                           "Yes", ""),
+      Significant            = ifelse(fixed_keep, "Yes", ""),
+      `In selected range`    = ifelse(range_keep, "Yes", ""),
+      check.names = FALSE,
       stringsAsFactors = FALSE
     )
     dt <- DT::datatable(
@@ -4754,11 +4950,15 @@ server <- function(input, output, session) {
       rownames = FALSE,
       caption  = tags$caption(
         style = "caption-side: top; text-align: left; color: #2c3e50; font-weight: bold;",
-        sprintf("Rows marked 'Yes' in Significant: p_val_adj < %.3g and |log2FC| >= %.3g.",
-                p_thr, fc_thr))
+        HTML(sprintf(
+          "<b>Significant</b> (fixed): p_val_adj &lt; %.3g and |log2FC| &ge; %.3g. &nbsp;&nbsp; <b>In selected range</b> (your sidebar values): p_val_adj &lt; %.3g and |log2FC| &ge; %.3g.",
+          DEA_SIG_P_FIXED, DEA_SIG_LOGFC_FIXED, p_thr, fc_thr)))
     )
-    DT::formatStyle(dt, "Significant",
+    dt <- DT::formatStyle(dt, "Significant",
                     backgroundColor = DT::styleEqual("Yes", "#e8f5e9"),
+                    fontWeight = DT::styleEqual("Yes", "bold"))
+    DT::formatStyle(dt, "In selected range",
+                    backgroundColor = DT::styleEqual("Yes", "#e3f2fd"),
                     fontWeight = DT::styleEqual("Yes", "bold"))
   }, server = TRUE)
   output$dea_download_plot <- downloadHandler(
@@ -4787,12 +4987,14 @@ server <- function(input, output, session) {
   output$dea_download_script <- downloadHandler(
     filename = function() "atlaslens_dea_reproduce.R",
     content  = function(file) {
+      # Use the FIXED significance cutoff so the script's `Significant` flag
+      # matches the app's definition (the sidebar values are exploratory only).
       writeLines(generate_dea_script(
         comparison_meta = vals$dea_meta_used %||% list(),
         filter_list     = vals$dea_filters_used %||% list(),
         highlight_gene  = input$dea_gene,
-        p_thr  = input$dea_p_threshold %||% 0.05,
-        fc_thr = input$dea_logfc_threshold %||% 0.585
+        p_thr  = DEA_SIG_P_FIXED,
+        fc_thr = DEA_SIG_LOGFC_FIXED
       ), file)
     }
   )
@@ -4873,7 +5075,7 @@ server <- function(input, output, session) {
       actionButton("go_run_analysis", "Run GO Enrichment", class = "btn-success btn-block btn-lg", icon = icon("play-circle"), style = "font-weight: bold;")
     }
   })
-
+  
   # Freeze the GO sidebar config (data source, mode, thresholds, ontology)
   # while an enrichment run is in progress so it cannot be reconfigured
   # mid-flight. The run button sits outside this wrapper and shows its own
@@ -4885,7 +5087,7 @@ server <- function(input, output, session) {
       shinyjs::removeClass(id = "go_config_wrap", class = "panel-disabled")
     }
   })
-
+  
   # Main analysis trigger
   observeEvent(input$go_run_analysis, {
     req(!vals$go_is_analyzing)
@@ -4953,6 +5155,13 @@ server <- function(input, output, session) {
                         ontology = ontology, p_cut = p_cut,
                         q_cut = q_cutoff, logfc_cut = fc_cut)
     
+    # Correct background: genes actually tested in DEA, not the whole OrgDb #Shamim
+    background_genes <- if (from_dea && !is.null(vals$dea_tested_genes)) {
+      vals$dea_tested_genes
+    } else {
+      NULL  # uploaded list has no background info; falls back to OrgDb default
+    }
+    
     shinyjs::show("go_loading_overlay")
     session$sendCustomMessage("start_timer", list(id = "go_timer"))
     vals$go_results <- NULL
@@ -4960,11 +5169,15 @@ server <- function(input, output, session) {
     vals$go_is_analyzing <- TRUE
     
     future({
-      run_go_worker(gene_list, species, ontology, p_cut, q_cutoff, mode, key_type)
+      # run_go_worker(gene_list, species, ontology, p_cut, q_cutoff, mode, key_type)
+      #Shamim
+      run_go_worker(gene_list, species, ontology, p_cut, q_cutoff, mode, key_type,
+                    universe = background_genes)
     }, globals = list(
       run_go_worker = run_go_worker, gene_list = gene_list, species = species,
       ontology = ontology, p_cut = p_cut, q_cutoff = q_cutoff,
-      mode = mode, key_type = key_type
+      mode = mode, key_type = key_type,
+      background_genes = background_genes  #Shamim
     ), packages = c("clusterProfiler", "org.Hs.eg.db", "org.Mm.eg.db",
                     "AnnotationDbi", "rrvgo", "GOSemSim"),
     seed = TRUE) %...>% (function(res) {
@@ -5074,9 +5287,15 @@ server <- function(input, output, session) {
   })
   
   # Dot plot
+  # output$go_dotplot <- renderPlot({
+  #   dl <- go_df_list(); req(length(dl) > 0)
+  #   create_go_dotplot(dl)
+  # }, height = 650)
+  
+  #Shamim
   output$go_dotplot <- renderPlot({
     dl <- go_df_list(); req(length(dl) > 0)
-    create_go_dotplot(dl)
+    create_go_dotplot(dl, top_n = input$go_top_n %||% 15)
   }, height = 650)
   
   # Named list of rrvgo reductions (one per panel) for the treemap + scatter.
@@ -5150,7 +5369,10 @@ server <- function(input, output, session) {
     filename = function() "go_dotplot.png",
     content  = function(file) {
       dl <- go_df_list()
-      ggplot2::ggsave(file, create_go_dotplot(dl), width = 12, height = 8, dpi = 300)
+      #ggplot2::ggsave(file, create_go_dotplot(dl), width = 12, height = 8, dpi = 300)
+      #Shamim
+      ggplot2::ggsave(file, create_go_dotplot(dl, top_n = input$go_top_n %||% 15),
+                      width = 12, height = 8, dpi = 300)
     }
   )
   output$go_download_treemap <- downloadHandler(
