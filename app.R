@@ -44,8 +44,6 @@ if (!exists("%||%", mode = "function")) {
 # Local-development convenience only: uncomment ONE of these to point the app at a
 # dataset on your own machine instead of exporting DATASET_PATH in the shell.
 # Left commented in the shared/main app so the env-var-driven design above stays intact.
-#Sys.setenv(DATASET_PATH = "~/Desktop/PhD/ML_project/SCVI/data/App/tabula_muris_seurat_with_ZK.rds")
-#Sys.setenv(DATASET_PATH = "~/Desktop/PhD/ML_project/SCVI/data/AMI_second_version/AMI.data.sets_V2.RDS")
 env_data_path <- Sys.getenv("DATASET_PATH")
 
 if (nzchar(env_data_path)) {
