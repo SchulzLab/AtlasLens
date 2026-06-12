@@ -87,15 +87,6 @@ COCOA_MAX_CELLS <- 500 # Limit cells per group for COCOA speed (Downsampling thr
 # dedicated "High-cardinality" bucket so nothing is silently dropped.
 MAX_LEVELS_FOR_GROUPING <- 1000L
 
-# Fixed, paper-defined "significant" call for differential expression. A gene is
-# significant ONLY when its adjusted p-value is below DEA_SIG_P_FIXED AND its
-# absolute log2 fold change is at least DEA_SIG_LOGFC_FIXED (0.585 = log2(1.5),
-# i.e. a 1.5-fold change). These never change with the sidebar controls: the
-# sidebar's "Adjusted P-value threshold" / "Min |log2FC|" define a separate,
-# user-adjustable EXPLORATORY range, surfaced as its own results-table column.
-DEA_SIG_P_FIXED     <- 0.05
-DEA_SIG_LOGFC_FIXED <- 0.585
-
 # On-screen UMAP rasterisation density (ggrastr geom_point_rast). The renderPlot
 # device is ~110 DPI, so a higher raster.dpi supersamples - it computes far more
 # pixels than the screen shows and is actually SLOWER than plain points. Keep
@@ -869,22 +860,17 @@ placeholder_plot <- function(msg = "Click \"Show Plot\" to render this view.") {
 
 create_dea_volcano_plot <- function(dea_results, highlight_gene = NULL, p_threshold = 0.05, logfc_threshold = 0.25, filter_list = NULL, show_significant = FALSE) {
   if (is.null(dea_results) || nrow(dea_results) == 0) return(NULL)
-  
-  # "Significant" is the FIXED, paper-defined call (grey dashed lines + red
-  # points) and never changes with the sidebar. The sidebar's adj-p / min|log2FC|
-  # define a separate, user-adjustable EXPLORATORY "selected range" drawn as blue
-  # dotted lines. p_threshold / logfc_threshold carry those sidebar values.
-  p_fixed  <- DEA_SIG_P_FIXED
-  fc_fixed <- DEA_SIG_LOGFC_FIXED
 
-  # "Show significant only" filters to the FIXED significant set, matching the
+  # Significance is defined by the sidebar "selected range" (adjusted p-value and
+  # min |log2FC|). Genes inside that range are the "selected range (significant)"
+  # set: red points here, dashed grey cutoff lines, and the flagged rows in the
   # results table.
   if (show_significant) {
-    dea_results <- dea_results %>% filter(p_val_adj < p_fixed & abs(avg_log2FC) >= fc_fixed)
+    dea_results <- dea_results %>% filter(p_val_adj < p_threshold & abs(avg_log2FC) >= logfc_threshold)
     if (nrow(dea_results) == 0) return(NULL)
   }
 
-  plot_df <- dea_results %>% mutate(NegLogP = -log10(p_val_adj), NegLogP = ifelse(is.infinite(NegLogP), 300, NegLogP), Significant = p_val_adj < p_fixed & abs(avg_log2FC) >= fc_fixed, IsHighlight = if (!is.null(highlight_gene) && highlight_gene != "") gene == highlight_gene else FALSE) %>% arrange(IsHighlight)
+  plot_df <- dea_results %>% mutate(NegLogP = -log10(p_val_adj), NegLogP = ifelse(is.infinite(NegLogP), 300, NegLogP), Significant = p_val_adj < p_threshold & abs(avg_log2FC) >= logfc_threshold, IsHighlight = if (!is.null(highlight_gene) && highlight_gene != "") gene == highlight_gene else FALSE) %>% arrange(IsHighlight)
   # Label the 10 most relevant genes, not just the first 10 rows: sort by
   # adjusted p-value, breaking ties by larger absolute fold change. Done on a
   # copy so plot_df keeps its IsHighlight draw order (highlighted point on top).
@@ -894,36 +880,18 @@ create_dea_volcano_plot <- function(dea_results, highlight_gene = NULL, p_thresh
   filter_str <- "Global Filters: None"
   if (!is.null(filter_list) && length(filter_list) > 0) { f_parts <- sapply(filter_list, function(f) { val_str <- paste(head(f$vals, 2), collapse=","); if(length(f$vals)>2) val_str <- paste0(val_str, "..."); paste0(f$col, "=(", val_str, ")") }); filter_str <- paste("Global Filters:", paste(f_parts, collapse="; ")) }
 
-  # Only draw the selected-range lines when the user has moved a threshold off
-  # the fixed cutoff; otherwise they'd sit exactly on the grey significance lines.
-  show_range <- !isTRUE(all.equal(p_threshold, p_fixed)) ||
-    !isTRUE(all.equal(logfc_threshold, fc_fixed))
-  caption_txt <- paste0(
-    sprintf("Grey dashed = fixed significance cutoff (adj. p < %.3g and |log2FC| >= %.3g) -> red points = Significant.",
-            p_fixed, fc_fixed),
-    if (show_range)
-      sprintf("\nBlue dotted = your sidebar selected range (adj. p < %.3g and |log2FC| >= %.3g) - exploratory, does not change the Significant call.",
-              p_threshold, logfc_threshold)
-    else "\nSidebar selected range currently matches the fixed cutoff.")
-
   # UPDATED: Use linewidth instead of size
   p <- ggplot(plot_df, aes(x = avg_log2FC, y = NegLogP)) +
     geom_point(aes(color = Significant), alpha = 0.5, size = 1.5, na.rm = TRUE) +
-    geom_vline(xintercept = c(-fc_fixed, fc_fixed), linetype = "dashed", color = "#7f8c8d", alpha = 0.8, linewidth = 0.8) +
-    geom_hline(yintercept = -log10(p_fixed), linetype = "dashed", color = "#7f8c8d", alpha = 0.8, linewidth = 0.8) +
+    geom_vline(xintercept = c(-logfc_threshold, logfc_threshold), linetype = "dashed", color = "#95a5a6", alpha = 0.6, linewidth = 0.8) +
+    geom_hline(yintercept = -log10(p_threshold), linetype = "dashed", color = "#95a5a6", alpha = 0.6, linewidth = 0.8) +
     scale_color_manual(values = c("TRUE" = "#e74c3c", "FALSE" = "#bdc3c7"),
                        breaks = c("TRUE", "FALSE"),
-                       labels = c("TRUE" = "Significant", "FALSE" = "Not significant"),
-                       name = sprintf("Significant (fixed)\nadj. p < %.3g & |log2FC| >= %.3g", p_fixed, fc_fixed)) +
+                       labels = c("TRUE" = "Selected range (significant)", "FALSE" = "Not significant"),
+                       name = sprintf("Selected range (significant)\nadj. p < %.3g & |log2FC| >= %.3g", p_threshold, logfc_threshold)) +
     geom_text_repel(aes(label = Label), max.overlaps = 20, box.padding = 0.5, na.rm = TRUE) +
-    labs(title = paste0("Volcano Plot: ", dea_results$group1[1], " vs ", dea_results$group2[1]), subtitle = paste0(if(!is.null(highlight_gene) && highlight_gene != "") paste("Highlighted Gene:", highlight_gene) else "All Genes", "\n", filter_str), x = "Log2 Fold Change", y = "-log10(Adj. P-Value)", caption = caption_txt) +
-    theme_minimal(base_size = 14) + theme(plot.title = element_text(face = "bold"), legend.position = "right", plot.caption = element_text(hjust = 0, size = 10, color = "#555555"))
-
-  if (show_range) {
-    p <- p +
-      geom_vline(xintercept = c(-logfc_threshold, logfc_threshold), linetype = "dotted", color = "#2980b9", alpha = 0.9, linewidth = 0.8) +
-      geom_hline(yintercept = -log10(p_threshold), linetype = "dotted", color = "#2980b9", alpha = 0.9, linewidth = 0.8)
-  }
+    labs(title = paste0("Volcano Plot: ", dea_results$group1[1], " vs ", dea_results$group2[1]), subtitle = paste0(if(!is.null(highlight_gene) && highlight_gene != "") paste("Highlighted Gene:", highlight_gene) else "All Genes", "\n", filter_str), x = "Log2 Fold Change", y = "-log10(Adj. P-Value)") +
+    theme_minimal(base_size = 14) + theme(plot.title = element_text(face = "bold"), legend.position = "right")
 
   if (!is.null(highlight_gene) && highlight_gene != "") p <- p + geom_point(data = subset(plot_df, IsHighlight), color = "black", fill = "yellow", shape = 21, size = 5, stroke = 1.5, na.rm = TRUE)
   return(p)
@@ -2172,20 +2140,17 @@ ui <- navbarPage(
                                           div(class = "section-header", icon("layer-group"), " 3. Select Metadata"), tags$label("Metadata Column:", style = "font-weight: bold;"), info_icon("Choose the column defining conditions."), selectInput("dea_meta_col", NULL, choices = NULL), hr(),
                                           div(class = "section-header", icon("code-branch"), " 4. Choose Two Submetadata"), tags$label("Submetadata 1 (Reference):", style = "font-weight: bold;"), selectInput("dea_group1", NULL, choices = NULL), tags$label("Submetadata 2 (Comparison):", style = "font-weight: bold;", style = "margin-top: 10px;"), selectInput("dea_group2", NULL, choices = NULL), uiOutput("dea_cell_count_ui"), hr(), 
                                           div(class = "section-header", icon("cogs"), " 5. Options"),
-                                          div(style = "background:#eef2fb; border-left:4px solid #667eea; padding:8px 10px; border-radius:4px; margin-bottom:10px; font-size:12px; color:#2c3e50;",
-                                              HTML(sprintf("<b>Significant</b> is a fixed call: <b>adj. p &lt; %.3g</b> and <b>|log2FC| &ge; %.3g</b> (= log2(1.5)). It never changes — it is the green <b>Significant</b> column and the red points / grey dashed lines on the volcano.<br><br>The two values below set a separate, <b>exploratory selected range</b> (the blue <b>In selected range</b> column and the blue dotted lines on the volcano). They do <b>not</b> change what counts as significant.",
-                                                           DEA_SIG_P_FIXED, DEA_SIG_LOGFC_FIXED))),
-                                          checkboxInput("dea_show_significant", "Show significant only (fixed cutoff)", value = FALSE),
-                                          tags$label("Selected range - Adjusted P-value:", style = "font-weight: bold;"),
-                                          info_icon("Exploratory only. Sets the 'In selected range' column and the blue dotted line on the volcano. Does NOT change the fixed Significant call."),
+                                          checkboxInput("dea_show_significant", "Show significant genes only", value = FALSE),
+                                          tags$label("Adjusted P-value threshold:", style = "font-weight: bold;"),
+                                          info_icon("Genes with p_val_adj below this (and |log2FC| at or above the cutoff below) are flagged as selected range (significant) in the results table and shown as red points on the volcano. Type to override."),
                                           numericInput("dea_p_threshold", NULL,
                                                        value = 0.05, min = 0, max = 1, step = 0.001),
-                                          helpText("Exploratory range, not the significance cutoff. Enter a value between 0 and 1."),
-                                          tags$label("Selected range - Min |log2FC|:", style = "font-weight: bold;"),
-                                          info_icon("Exploratory only. Minimum absolute log2 fold change for the 'In selected range' column and the blue dotted lines - both up- and down-regulated. Does NOT change the fixed Significant call."),
+                                          helpText("0.05 is the usual significance cutoff; 0.1 is sometimes used. Enter a value between 0 and 1."),
+                                          tags$label("Min |log2FC|:", style = "font-weight: bold;"),
+                                          info_icon("Minimum absolute log2 fold change. Genes with |log2FC| at or above this (and an adjusted p-value below the threshold above) are flagged as selected range (significant) - both up- and down-regulated."),
                                           numericInput("dea_logfc_threshold", NULL,
                                                        value = 0.585, min = 0, max = 10, step = 0.05),
-                                          helpText("Exploratory range, not the significance cutoff. Enter a value of 0 or greater."),
+                                          helpText("Enter a value of 0 or greater."),
                                           sliderInput("dea_volcano_height", "Volcano plot height (px):",
                                                       min = 400, max = 1100, value = 650, step = 25),
                                           sliderInput("dea_violin_height", "Single-gene violin height (px):",
@@ -4907,31 +4872,18 @@ server <- function(input, output, session) {
     req(fr)
     validate(need(nrow(fr) > 0,
                   "None of the uploaded genes match the DEA results."))
-    # Two independent calls per gene:
-    #   * Significant         -> the FIXED, paper-defined cutoff (never changes).
-    #   * In selected range   -> the user's sidebar adj-p / min|log2FC| values.
+    # A gene is flagged "selected range (significant)" when it falls inside the
+    # sidebar selected range: adjusted p-value below the threshold AND |log2FC| at
+    # or above the cutoff.
     p_thr  <- input$dea_p_threshold     %||% 0.05
     fc_thr <- input$dea_logfc_threshold %||% 0.585
     raw <- fr
-
-    fixed_mask <- !is.na(raw$p_val_adj) & raw$p_val_adj < DEA_SIG_P_FIXED &
-      !is.na(raw$avg_log2FC) & abs(raw$avg_log2FC) >= DEA_SIG_LOGFC_FIXED
-    range_mask <- !is.na(raw$p_val_adj) & raw$p_val_adj < p_thr &
-      !is.na(raw$avg_log2FC) & abs(raw$avg_log2FC) >= fc_thr
-
-    # The "Show significant only" checkbox filters to the FIXED significant set,
-    # keeping it consistent with the paper-defined Significant column.
     if (isTRUE(input$dea_show_significant)) {
-      keep       <- fixed_mask
-      raw        <- raw[keep, , drop = FALSE]
-      fixed_mask <- fixed_mask[keep]
-      range_mask <- range_mask[keep]
+      sig_mask <- !is.na(raw$p_val_adj) & raw$p_val_adj < p_thr &
+        !is.na(raw$avg_log2FC) & abs(raw$avg_log2FC) >= fc_thr
+      raw <- raw[sig_mask, , drop = FALSE]
     }
-
-    ord <- order(raw$p_val_adj, na.last = TRUE)
-    raw <- raw[ord, , drop = FALSE]
-    fixed_keep <- fixed_mask[ord]
-    range_keep <- range_mask[ord]
+    raw <- raw[order(raw$p_val_adj, na.last = TRUE), , drop = FALSE]
     table_df <- data.frame(
       gene       = raw$gene,
       avg_log2FC = round(raw$avg_log2FC, 4),
@@ -4939,8 +4891,9 @@ server <- function(input, output, session) {
       p_val_adj  = formatC(raw$p_val_adj, format = "e", digits = 2),
       pct.1      = round(raw$pct.1, 3),
       pct.2      = round(raw$pct.2, 3),
-      Significant            = ifelse(fixed_keep, "Yes", ""),
-      `In selected range`    = ifelse(range_keep, "Yes", ""),
+      `selected range (significant)` = ifelse(!is.na(raw$p_val_adj) & raw$p_val_adj < p_thr &
+                             !is.na(raw$avg_log2FC) & abs(raw$avg_log2FC) >= fc_thr,
+                           "Yes", ""),
       check.names = FALSE,
       stringsAsFactors = FALSE
     )
@@ -4950,15 +4903,11 @@ server <- function(input, output, session) {
       rownames = FALSE,
       caption  = tags$caption(
         style = "caption-side: top; text-align: left; color: #2c3e50; font-weight: bold;",
-        HTML(sprintf(
-          "<b>Significant</b> (fixed): p_val_adj &lt; %.3g and |log2FC| &ge; %.3g. &nbsp;&nbsp; <b>In selected range</b> (your sidebar values): p_val_adj &lt; %.3g and |log2FC| &ge; %.3g.",
-          DEA_SIG_P_FIXED, DEA_SIG_LOGFC_FIXED, p_thr, fc_thr)))
+        sprintf("Rows marked 'Yes' in selected range (significant): p_val_adj < %.3g and |log2FC| >= %.3g.",
+                p_thr, fc_thr))
     )
-    dt <- DT::formatStyle(dt, "Significant",
+    DT::formatStyle(dt, "selected range (significant)",
                     backgroundColor = DT::styleEqual("Yes", "#e8f5e9"),
-                    fontWeight = DT::styleEqual("Yes", "bold"))
-    DT::formatStyle(dt, "In selected range",
-                    backgroundColor = DT::styleEqual("Yes", "#e3f2fd"),
                     fontWeight = DT::styleEqual("Yes", "bold"))
   }, server = TRUE)
   output$dea_download_plot <- downloadHandler(
@@ -4987,14 +4936,12 @@ server <- function(input, output, session) {
   output$dea_download_script <- downloadHandler(
     filename = function() "atlaslens_dea_reproduce.R",
     content  = function(file) {
-      # Use the FIXED significance cutoff so the script's `Significant` flag
-      # matches the app's definition (the sidebar values are exploratory only).
       writeLines(generate_dea_script(
         comparison_meta = vals$dea_meta_used %||% list(),
         filter_list     = vals$dea_filters_used %||% list(),
         highlight_gene  = input$dea_gene,
-        p_thr  = DEA_SIG_P_FIXED,
-        fc_thr = DEA_SIG_LOGFC_FIXED
+        p_thr  = input$dea_p_threshold %||% 0.05,
+        fc_thr = input$dea_logfc_threshold %||% 0.585
       ), file)
     }
   )
