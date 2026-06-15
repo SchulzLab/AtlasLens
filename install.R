@@ -83,7 +83,8 @@ bioc_pkgs <- c(
   "biomaRt",           # Ensembl ID -> gene symbol conversion (geneCOCOA tab)
   "GO.db",             # Gene Ontology term database
   "org.Hs.eg.db",      # human gene annotation
-  "org.Mm.eg.db"       # mouse gene annotation
+  "org.Mm.eg.db",      # mouse gene annotation
+  "org.Dr.eg.db"       # zebrafish (Danio rerio) gene annotation
 )
 message("")
 message("[2/3] Bioconductor packages (Bioconductor ", bioc_version, ")")

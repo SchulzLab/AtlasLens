@@ -50,8 +50,8 @@ RUN R -e "BiocManager::install('gemma.R')"
 # GO Enrichment + biomaRt stack (Bioconductor 3.18 matches R 4.3.x).
 # clusterProfiler / rrvgo / GOSemSim / enrichplot / DOSE / AnnotationDbi : GO over-representation + semantic-similarity reduction
 # biomaRt                                                                 : Ensembl ID -> gene symbol conversion (geneCOCOA + GO tabs)
-# GO.db / org.Hs.eg.db / org.Mm.eg.db                                     : GO term + human / mouse gene annotation
-RUN R -e "BiocManager::install(c('clusterProfiler', 'rrvgo', 'GOSemSim', 'enrichplot', 'DOSE', 'AnnotationDbi', 'biomaRt', 'GO.db', 'org.Hs.eg.db', 'org.Mm.eg.db'), version = '3.18', update = FALSE, ask = FALSE)"
+# GO.db / org.Hs.eg.db / org.Mm.eg.db / org.Dr.eg.db                      : GO term + human / mouse / zebrafish gene annotation
+RUN R -e "BiocManager::install(c('clusterProfiler', 'rrvgo', 'GOSemSim', 'enrichplot', 'DOSE', 'AnnotationDbi', 'biomaRt', 'GO.db', 'org.Hs.eg.db', 'org.Mm.eg.db', 'org.Dr.eg.db'), version = '3.18', update = FALSE, ask = FALSE)"
 
 RUN R -e "remotes::install_github('si-ze/geneCOCOA', upgrade = 'never')"
 

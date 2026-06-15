@@ -329,23 +329,64 @@ sort_timepoints <- function(tps) {
   tps
 }
 
-# Infer the species of a Seurat object from gene-symbol casing. Human
-# symbols are almost always all-caps (TNF, IL6, GAPDH); mouse symbols are
-# title-case (Tnf, Il6, Gapdh). Returns one of "Homo sapiens" or
-# "Mus musculus" — the two species expected by msigdbr::msigdbr().
-detect_species <- function(seurat_obj) {
-  genes <- rownames(seurat_obj)
+# Canonical species names AtlasLens supports - exactly the strings
+# msigdbr::msigdbr() expects. Everything species-dependent (OrgDb package,
+# BioMart dataset, Ensembl-ID prefix, Hallmark gene sets) is derived from one of
+# these. To add another species: list it here, teach normalize_species() and
+# detect_species_from_genes() its naming, extend the org_db/dataset switch() in
+# run_go_worker()/run_biomart_query()/map_ensembl_to_symbol(), and install its
+# org.*.eg.db annotation package.
+SUPPORTED_SPECIES <- c("Homo sapiens", "Mus musculus", "Danio rerio")
+
+# Map however a curator names a species in landing_config.json (scientific name,
+# common name, or short code) onto one canonical SUPPORTED_SPECIES value. Returns
+# NA_character_ when the input is empty or unrecognized, so callers fall back to
+# auto-detection.
+normalize_species <- function(x) {
+  if (is.null(x) || length(x) == 0) return(NA_character_)
+  key <- tolower(trimws(as.character(x)[1]))
+  if (is.na(key) || !nzchar(key)) return(NA_character_)
+  aliases <- c(
+    "homo sapiens" = "Homo sapiens", "human" = "Homo sapiens",
+    "hsapiens" = "Homo sapiens", "h. sapiens" = "Homo sapiens", "hs" = "Homo sapiens",
+    "mus musculus" = "Mus musculus", "mouse" = "Mus musculus",
+    "mmusculus" = "Mus musculus", "m. musculus" = "Mus musculus", "mm" = "Mus musculus",
+    "danio rerio" = "Danio rerio", "zebrafish" = "Danio rerio", "zebra fish" = "Danio rerio",
+    "drerio" = "Danio rerio", "d. rerio" = "Danio rerio", "dr" = "Danio rerio"
+  )
+  val <- unname(aliases[key])
+  if (is.na(val)) NA_character_ else val
+}
+
+# Infer species from a vector of gene identifiers. An explicit `configured` value
+# (the landing_config.json "species" field) always wins. Otherwise we guess:
+# Ensembl gene IDs carry an unambiguous species prefix (ENSMUSG = mouse,
+# ENSDARG = zebrafish, ENSG = human), so those are checked first. The casing
+# fallback works because each nomenclature uses a distinct case - human symbols
+# are all-caps (TNF, IL6), mouse are title-case (Tnf, Il6), zebrafish are
+# lowercase (sox2, pax6a). Casing is only a heuristic; curators should set the
+# "species" field when their symbols don't follow these conventions.
+detect_species_from_genes <- function(genes, configured = NULL) {
+  cfg <- normalize_species(configured)
+  if (!is.na(cfg)) return(cfg)
   if (length(genes) == 0) return("Mus musculus")
   sample_genes <- if (length(genes) > 2000) sample(genes, 2000) else genes
-  # Ensembl gene IDs carry an unambiguous species prefix (ENSMUSG... = mouse,
-  # ENSG... = human). Check that first — the all-caps casing heuristic below
-  # would otherwise misread every Ensembl ID as a human symbol.
+  if (mean(grepl("^ENSDAR", sample_genes)) > 0.5) return("Danio rerio")
   if (mean(grepl("^ENSMUS", sample_genes)) > 0.5) return("Mus musculus")
   if (mean(grepl("^ENSG[0-9]", sample_genes)) > 0.5) return("Homo sapiens")
   alphabetic <- sample_genes[grepl("^[A-Za-z]", sample_genes)]
   if (length(alphabetic) == 0) return("Mus musculus")
   upper_frac <- mean(alphabetic == toupper(alphabetic))
-  if (upper_frac > 0.7) "Homo sapiens" else "Mus musculus"
+  lower_frac <- mean(alphabetic == tolower(alphabetic))
+  if (upper_frac > 0.7) return("Homo sapiens")
+  if (lower_frac > 0.7) return("Danio rerio")
+  "Mus musculus"
+}
+
+# Convenience wrapper for the existing call sites: detect from a Seurat object's
+# rownames, with an optional configured override taken from landing_config.json.
+detect_species <- function(seurat_obj, configured = NULL) {
+  detect_species_from_genes(rownames(seurat_obj), configured)
 }
 
 # Detect plausible "control" condition values within a vector of condition
@@ -543,8 +584,20 @@ run_dea_worker <- function(subset_counts, subset_meta, meta_col, group1, group2)
 #Shamim
 run_go_worker <- function(gene_list, species, ontology, p_cutoff, q_cutoff,
                           mode, key_type, universe = NULL) {
-  org_db <- if (species == "Homo sapiens") "org.Hs.eg.db" else "org.Mm.eg.db"
-  
+  org_db <- switch(species,
+                   "Homo sapiens" = "org.Hs.eg.db",
+                   "Mus musculus" = "org.Mm.eg.db",
+                   "Danio rerio"  = "org.Dr.eg.db",
+                   "org.Mm.eg.db")
+  # The OrgDb is loaded by clusterProfiler / rrvgo on demand, so it only needs to
+  # be installed (not in the future's `packages` list). Fail early with the exact
+  # install command rather than deep inside enrichGO.
+  if (!requireNamespace(org_db, quietly = TRUE)) {
+    stop("Annotation package '", org_db, "' is required for species '", species,
+         "' but is not installed. Install it with BiocManager::install('", org_db, "').",
+         call. = FALSE)
+  }
+
   # Run clusterProfiler::enrichGO on one gene set and return a plain data
   # frame (plain data frames serialise cleanly back from the future worker).
   enrich_df <- function(genes) {
@@ -697,7 +750,11 @@ is_ensembl_object <- function(seurat_obj) {
 # Query Ensembl BioMart for Ensembl-gene-ID -> symbol mappings. Runs inside a
 # future worker; only the (small) ID vector is sent, never the Seurat object.
 run_biomart_query <- function(ens_ids, species) {
-  dataset <- if (species == "Homo sapiens") "hsapiens_gene_ensembl" else "mmusculus_gene_ensembl"
+  dataset <- switch(species,
+                    "Homo sapiens" = "hsapiens_gene_ensembl",
+                    "Mus musculus" = "mmusculus_gene_ensembl",
+                    "Danio rerio"  = "drerio_gene_ensembl",
+                    "mmusculus_gene_ensembl")
   # The "dataset not valid" error users hit is almost always a transient
   # Ensembl outage on the default host, not a genuinely missing dataset.
   # Try the main site and the regional mirrors first; if the whole rolling
@@ -759,7 +816,11 @@ run_biomart_query <- function(ens_ids, species) {
 # IDs the caller passes in.
 map_ensembl_to_symbol <- function(ens_ids, species) {
   ens_ids <- unique(ens_ids)
-  org_pkg <- if (species == "Homo sapiens") "org.Hs.eg.db" else "org.Mm.eg.db"
+  org_pkg <- switch(species,
+                    "Homo sapiens" = "org.Hs.eg.db",
+                    "Mus musculus" = "org.Mm.eg.db",
+                    "Danio rerio"  = "org.Dr.eg.db",
+                    "org.Mm.eg.db")
   
   offline <- NULL
   if (requireNamespace(org_pkg, quietly = TRUE) &&
@@ -939,7 +1000,11 @@ build_expression_umap <- function(df, gene_name, expr, limits = NULL, raster_dpi
 # app directory (manuscript §2: personalized "introduction" + "dataset
 # information"). No upload and no in-app editor - the file is read once at
 # startup. Expected schema (all fields optional):
-#   { "introduction": "...", "dataset_information": "..." }
+#   { "introduction": "...", "dataset_information": "...", "species": "..." }
+# The optional "species" field (e.g. "Homo sapiens", "Mus musculus", "Danio
+# rerio", or a common name such as "zebrafish") overrides automatic species
+# detection wherever the app needs it (GO enrichment, Ensembl->symbol mapping,
+# Hallmark gene sets). Leave it empty to auto-detect from the gene names.
 # Search order: $ATLASLENS_LANDING_CONFIG, then landing_config.json in the
 # working directory, then app/landing_config.json. Returns NULL if none is found
 # or the file can't be parsed (the Introduction tab then renders nothing).
@@ -960,8 +1025,19 @@ load_landing_config <- function() {
   # Collapse a string or array-of-strings field into one block of text; NULL out
   # anything empty so the renderer's nzchar() checks fall through to guidance.
   pick <- function(x) if (!is.null(x) && length(x) && nzchar(paste(x, collapse = ""))) paste(x, collapse = "\n") else NULL
-  list(introduction       = pick(cfg$introduction),
-       dataset_information = pick(cfg$dataset_information))
+  # Optional explicit species declaration. Authoritative when present (overrides
+  # auto-detection); warn and fall back to detection when it is set but is not a
+  # species we support.
+  norm_species <- normalize_species(cfg$species)
+  if (!is.null(cfg$species) && length(cfg$species) &&
+      nzchar(paste(cfg$species, collapse = "")) && is.na(norm_species)) {
+    warning("AtlasLens: unrecognized 'species' value '", paste(cfg$species, collapse = ""),
+            "' in landing config. Supported: ", paste(SUPPORTED_SPECIES, collapse = ", "),
+            ". Falling back to auto-detection.")
+  }
+  list(introduction        = pick(cfg$introduction),
+       dataset_information = pick(cfg$dataset_information),
+       species             = if (is.na(norm_species)) NULL else norm_species)
 }
 
 # Parse free-text or uploaded gene list. Genes can be on separate lines, or
@@ -1348,7 +1424,9 @@ generate_cocoa_script <- function(gene, comparison_meta, filter_list,
     "  if (!('geneset' %in% colnames(d))) d$geneset <- rownames(d)",
     "  pval <- if ('p.adj' %in% colnames(d)) d$p.adj else d$p",
     "  data.frame(Pathway = gsub('HALLMARK_', '', d$geneset),",
-    "             NLP = -log10(pval), Group = g, stringsAsFactors = FALSE)",
+    "             # Cap NLP: geneCOCOA's empirical p can be 0 -> -log10(0)=Inf,",
+    "             # which sorts to the top of the axis but draws no bar.",
+    "             NLP = pmin(-log10(pval), 300), Group = g, stringsAsFactors = FALSE)",
     "}))",
     "plot_df <- plot_df[is.finite(plot_df$NLP), , drop = FALSE]",
     "coreg <- ggplot(plot_df, aes(NLP, reorder(Pathway, NLP), fill = Group)) +",
@@ -1374,6 +1452,9 @@ generate_go_script <- function(go_settings, filter_list) {
     "  library(rrvgo)",
     "  library(org.Hs.eg.db)",
     "  library(org.Mm.eg.db)",
+    "  # Zebrafish annotation - loaded only if installed, so human/mouse",
+    "  # reproductions don't require it.",
+    "  if (requireNamespace('org.Dr.eg.db', quietly = TRUE)) library(org.Dr.eg.db)",
     "})",
     "",
     paste0("data_source <- ", r_literal(go_settings$data_source %||% "DEA")),
@@ -1390,12 +1471,25 @@ generate_go_script <- function(go_settings, filter_list) {
     "sig <- dea[!is.na(dea$p_val_adj) & dea$p_val_adj < p_cut &",
     "             !is.na(dea$avg_log2FC) & abs(dea$avg_log2FC) >= fc_cut, , drop = FALSE]",
     "",
-    "# Species + key type auto-detected from the gene-symbol casing / prefix.",
     "all_genes <- unique(sig$gene)",
-    "species  <- if (mean(grepl('^ENSMUS', all_genes)) > 0.5 ||",
-    "                 mean(all_genes == toupper(all_genes)) < 0.7)",
-    "              'Mus musculus' else 'Homo sapiens'",
-    "org_db   <- if (species == 'Homo sapiens') 'org.Hs.eg.db' else 'org.Mm.eg.db'",
+    "# Species the app used. If left blank, it is auto-detected from the gene",
+    "# Ensembl prefix (ENSMUSG / ENSDARG / ENSG) or symbol casing (UPPER = human,",
+    "# Title = mouse, lower = zebrafish). Edit this string to override.",
+    paste0("species  <- ", r_literal(go_settings$species %||% "")),
+    "if (!nzchar(species)) {",
+    "  alpha <- all_genes[grepl('^[A-Za-z]', all_genes)]",
+    "  species <- if (mean(grepl('^ENSDAR', all_genes)) > 0.5) 'Danio rerio'",
+    "    else if (mean(grepl('^ENSMUS', all_genes)) > 0.5) 'Mus musculus'",
+    "    else if (mean(grepl('^ENSG[0-9]', all_genes)) > 0.5) 'Homo sapiens'",
+    "    else if (length(alpha) > 0 && mean(alpha == toupper(alpha)) > 0.7) 'Homo sapiens'",
+    "    else if (length(alpha) > 0 && mean(alpha == tolower(alpha)) > 0.7) 'Danio rerio'",
+    "    else 'Mus musculus'",
+    "}",
+    "org_db   <- switch(species,",
+    "  'Homo sapiens' = 'org.Hs.eg.db',",
+    "  'Mus musculus' = 'org.Mm.eg.db',",
+    "  'Danio rerio'  = 'org.Dr.eg.db',",
+    "  'org.Mm.eg.db')",
     "key_type <- if (mean(grepl('^ENS', all_genes)) > 0.5) 'ENSEMBL' else 'SYMBOL'",
     "",
     "if (mode == 'compare') {",
@@ -2217,7 +2311,7 @@ ui <- navbarPage(
                               # --- Ontology ---
                               div(class = "section-header", icon("sitemap"), " 4. GO Ontology"),
                               selectInput("go_ontology", "Ontology:", choices = c("Biological Process" = "BP", "Molecular Function" = "MF", "Cellular Component" = "CC"), selected = "BP"),
-                              helpText("Species and gene-ID type are detected automatically from your genes."),
+                              helpText("Gene-ID type is detected automatically. Species comes from the landing_config.json \"species\" field when set (e.g. \"Homo sapiens\", \"Mus musculus\", \"Danio rerio\"/\"zebrafish\"); otherwise it is auto-detected from your genes."),
                               # hr()),
                               # # --- Run button ---
                               # br(),
@@ -4355,7 +4449,7 @@ server <- function(input, output, session) {
       return()
     }
     obj      <- vals$data
-    species  <- detect_species(obj)
+    species  <- detect_species(obj, vals$landing_config$species)
     orig_ids <- rownames(obj)
     ens_keys <- sub("\\.[0-9]+$", "", orig_ids)
     vals$cocoa_is_converting <- TRUE
@@ -4544,8 +4638,9 @@ server <- function(input, output, session) {
     #log_transform_flag <- FALSE
     log_transform_flag <- TRUE #log2 transform CPM
     n_sims_cfg <- 100L
-    # Species inference for msigdbr gene-set lookup.
-    species_cfg <- detect_species(vals$data)
+    # Species inference for msigdbr gene-set lookup (landing_config "species"
+    # wins; otherwise auto-detected).
+    species_cfg <- detect_species(vals$data, vals$landing_config$species)
     
     future({
       # msigdbr runs INSIDE the future — with multicore (fork), this avoids
@@ -4595,19 +4690,57 @@ server <- function(input, output, session) {
           downloadButton("download_analysis", "Download Plot", class = "btn-success"))
     )
   })
-  output$analysis_plot <- renderPlot({ req(vals$analysis_res); gene_to_show <- if(!is.null(vals$cocoa_gene_used)) vals$cocoa_gene_used else "Unknown"; filters_to_show <- if(!is.null(vals$cocoa_filters_used)) vals$cocoa_filters_used else list(); res <- vals$analysis_res; plot_df <- bind_rows(lapply(names(res), function(g) { d <- res[[g]]; if(is.null(d)) return(NULL); d <- as.data.frame(d); if(!("geneset" %in% colnames(d))) d$geneset <- rownames(d); tibble(Pathway = gsub("HALLMARK_", "", d$geneset), PVal = if("p.adj" %in% colnames(d)) d$p.adj else d$p, NLP = -log10(PVal), Group = g) })); if (nrow(plot_df) == 0) { plot.new(); text(0.5, 0.5, "No significant pathways.", cex = 1.5); return() }; plot_df_filtered <- plot_df %>% filter(PVal < input$p_val_thresh); if (nrow(plot_df_filtered) == 0) { plot.new(); text(0.5, 0.5, "No pathways below P-value threshold.", cex = 1.5); return() }; filter_str <- "Global Filters: None"; if (length(filters_to_show) > 0) { f_parts <- sapply(filters_to_show, function(f) { val_str <- paste(head(f$vals, 2), collapse=","); if(length(f$vals)>2) val_str <- paste0(val_str, "..."); paste0(f$col, "=(", val_str, ")") }); filter_str <- paste("Global Filters:", paste(f_parts, collapse="; ")) }; ggplot(plot_df_filtered, aes(x = NLP, y = reorder(Pathway, NLP), fill = Group)) + geom_col(position = position_dodge(width = 0.8), width = 0.7, alpha = 0.8) + scale_fill_brewer(palette = "Set2") + labs(title = paste("Co-regulation:", gene_to_show), subtitle = paste0("Comparison: ", vals$analysis_meta$col, "\n", filter_str), x = "-log10(Adjusted P-Value)", y = NULL) + theme_minimal(base_size = 14) + theme(plot.title = element_text(face = "bold", size = 18), legend.position = "bottom") }, height = 800)
-  #output$download_analysis <- downloadHandler(filename = function() paste0("cocoa_", input$analysis_gene, ".png"), content = function(file) ggsave(file, width = 12, height = 9))
-  #adding plot argument
+  # Shared builder for the geneCOCOA co-regulation bar chart so the on-screen
+  # plot and the PNG download render identically (the download previously built
+  # an empty stub and failed). Returns list(plot, msg): plot is the ggplot, or
+  # NULL with msg holding the placeholder text for the empty cases. NLP is capped
+  # at 300 because geneCOCOA's empirical p-value can be exactly 0 (a pathway that
+  # beats every permutation); an uncapped -log10(0) = Inf sorts that pathway to
+  # the top of the axis but draws no bar.
+  cocoa_plot_data <- reactive({
+    req(vals$analysis_res)
+    gene_to_show <- if (!is.null(vals$cocoa_gene_used)) vals$cocoa_gene_used else "Unknown"
+    filters_to_show <- if (!is.null(vals$cocoa_filters_used)) vals$cocoa_filters_used else list()
+    res <- vals$analysis_res
+    plot_df <- bind_rows(lapply(names(res), function(g) {
+      d <- res[[g]]; if (is.null(d)) return(NULL); d <- as.data.frame(d)
+      if (!("geneset" %in% colnames(d))) d$geneset <- rownames(d)
+      tibble(Pathway = gsub("HALLMARK_", "", d$geneset),
+             PVal = if ("p.adj" %in% colnames(d)) d$p.adj else d$p,
+             NLP = pmin(-log10(PVal), 300), Group = g)
+    }))
+    if (nrow(plot_df) == 0) return(list(plot = NULL, msg = "No significant pathways."))
+    plot_df_filtered <- plot_df %>% filter(PVal < input$p_val_thresh)
+    if (nrow(plot_df_filtered) == 0) return(list(plot = NULL, msg = "No pathways below P-value threshold."))
+    filter_str <- "Global Filters: None"
+    if (length(filters_to_show) > 0) {
+      f_parts <- sapply(filters_to_show, function(f) { val_str <- paste(head(f$vals, 2), collapse=","); if(length(f$vals)>2) val_str <- paste0(val_str, "..."); paste0(f$col, "=(", val_str, ")") })
+      filter_str <- paste("Global Filters:", paste(f_parts, collapse="; "))
+    }
+    p <- ggplot(plot_df_filtered, aes(x = NLP, y = reorder(Pathway, NLP), fill = Group)) +
+      geom_col(position = position_dodge(width = 0.8), width = 0.7, alpha = 0.8) +
+      scale_fill_brewer(palette = "Set2") +
+      labs(title = paste("Co-regulation:", gene_to_show),
+           subtitle = paste0("Comparison: ", vals$analysis_meta$col, "\n", filter_str),
+           x = "-log10(Adjusted P-Value)", y = NULL) +
+      theme_minimal(base_size = 14) +
+      theme(plot.title = element_text(face = "bold", size = 18), legend.position = "bottom")
+    list(plot = p, msg = NULL)
+  })
+  output$analysis_plot <- renderPlot({
+    pd <- cocoa_plot_data()
+    if (is.null(pd$plot)) { plot.new(); text(0.5, 0.5, pd$msg, cex = 1.5); return() }
+    pd$plot
+  }, height = 800)
   output$download_analysis <- downloadHandler(
-    filename = function() paste0("cocoa_", input$analysis_gene, ".png"),
+    filename = function() paste0("cocoa_", input$analysis_gene %||% "gene", ".png"),
     content = function(file) {
-      req(vals$analysis_res)
-      # Re-render the plot explicitly rather than relying on last_plot()
-      p <- isolate({
-        # same plot logic as output$analysis_plot
-        # ideally extract to a reactive or named function
-      })
-      ggsave(file, plot = p, width = 12, height = 9, dpi = 300)
+      pd <- cocoa_plot_data()
+      # Fall back to a labelled blank panel so the download never errors out.
+      plot_obj <- pd$plot %||% (ggplot() +
+        annotate("text", x = 0, y = 0, label = pd$msg %||% "No pathways to display") +
+        theme_void())
+      ggsave(file, plot = plot_obj, width = 12, height = 9, dpi = 300)
     }
   )                                                                                                                                                                                                                                                                                                                                 
   
@@ -5078,15 +5211,13 @@ server <- function(input, output, session) {
       gene_list <- list(genes = unique(sig_df$gene))
     }
     
-    # Auto-detect species and gene-ID type from the genes themselves.
+    # Resolve species (landing_config "species" wins; otherwise auto-detect from
+    # the genes) and the gene-ID type from the genes themselves.
     all_genes <- unique(unlist(gene_list, use.names = FALSE))
-    species <- if (!is.null(vals$data)) detect_species(vals$data) else {
-      if (mean(grepl("^ENSMUS", all_genes)) > 0.5) "Mus musculus"
-      else if (mean(grepl("^ENSG[0-9]", all_genes)) > 0.5) "Homo sapiens"
-      else {
-        alpha <- all_genes[grepl("^[A-Za-z]", all_genes)]
-        if (length(alpha) > 0 && mean(alpha == toupper(alpha)) > 0.7) "Homo sapiens" else "Mus musculus"
-      }
+    species <- if (!is.null(vals$data)) {
+      detect_species(vals$data, vals$landing_config$species)
+    } else {
+      detect_species_from_genes(all_genes, vals$landing_config$species)
     }
     key_type <- if (length(all_genes) > 0 &&
                     mean(grepl("^ENS", all_genes)) > 0.5) "ENSEMBL" else "SYMBOL"
@@ -5371,6 +5502,11 @@ server <- function(input, output, session) {
   output$go_download_script <- downloadHandler(
     filename = function() "atlaslens_go_reproduce.R",
     content  = function(file) {
+      # Bake in the species the app resolved (config override or auto-detect) so
+      # the script doesn't have to re-guess; blank falls back to in-script detection.
+      sp <- if (!is.null(vals$data)) detect_species(vals$data, vals$landing_config$species)
+            else normalize_species(vals$landing_config$species)
+      if (length(sp) == 0 || is.na(sp)) sp <- ""
       writeLines(generate_go_script(
         go_settings = list(
           data_source = input$go_data_source,
@@ -5378,7 +5514,8 @@ server <- function(input, output, session) {
           ontology    = input$go_ontology,
           p_cut       = input$go_p_cutoff,
           q_cut       = input$go_q_cutoff,
-          logfc_cut   = input$go_logfc_cutoff
+          logfc_cut   = input$go_logfc_cutoff,
+          species     = sp
         ),
         filter_list = list()
       ), file)

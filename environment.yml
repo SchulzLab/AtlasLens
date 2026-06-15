@@ -34,6 +34,7 @@ dependencies:
   - bioconductor-matrixgenerics=1.14.0=r43hdfd78af_3
   - bioconductor-org.hs.eg.db=3.18.0=r43hdfd78af_0
   - bioconductor-org.mm.eg.db=3.18.0=r43hdfd78af_0
+  - bioconductor-org.dr.eg.db=3.18.0=r43hdfd78af_0
   - bioconductor-qvalue=2.34.0=r43hdfd78af_0
   - bioconductor-rrvgo=1.14.0=r43hdfd78af_0
   - bioconductor-s4arrays=1.2.0=r43ha9d7317_2
