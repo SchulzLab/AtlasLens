@@ -1436,7 +1436,9 @@ generate_cocoa_script <- function(gene, comparison_meta, filter_list,
     "plot_df <- plot_df[is.finite(plot_df$NLP), , drop = FALSE]",
     "coreg <- ggplot(plot_df, aes(NLP, reorder(Pathway, NLP), fill = Group)) +",
     "  geom_col(position = position_dodge(width = 0.8), width = 0.7, alpha = 0.85) +",
-    "  scale_fill_brewer(palette = 'Set2') +",
+    "  # scale_fill_hue() gives every group a distinct colour for any group count;",
+    "  # Set2 has only 8, so extra comparison groups would get an invisible NA fill.",
+    "  scale_fill_hue() +",
     "  labs(title = paste('Co-regulation:', gene_of_interest),",
     "       x = '-log10(P-Value)', y = NULL) +",
     "  theme_minimal(base_size = 14)",
@@ -3558,7 +3560,7 @@ server <- function(input, output, session) {
     
     n_conds <- length(levels(df$Condition))
     cond_palette <- if (n_conds <= 2) c("#3498db", "#e74c3c")
-    else RColorBrewer::brewer.pal(max(3, n_conds), "Set2")[seq_len(n_conds)]
+    else get_expanded_palette(n_conds)
     subtitle_str <- paste("Condition:", paste(levels(df$Condition), collapse = " + "),
                           "| Cell type:", vals$ts_active_celltype)
     
@@ -3626,7 +3628,7 @@ server <- function(input, output, session) {
     
     n_conds <- length(levels(df$Condition))
     cond_palette <- if (n_conds <= 2) c("#3498db", "#e74c3c")
-    else RColorBrewer::brewer.pal(max(3, n_conds), "Set2")[seq_len(n_conds)]
+    else get_expanded_palette(n_conds)
     subtitle_str <- paste("Condition:", paste(levels(df$Condition), collapse = " + "),
                           "| Cell type:", vals$ts_active_celltype)
     
@@ -3724,7 +3726,7 @@ server <- function(input, output, session) {
     
     n_conds <- length(levels(df$Condition))
     cond_palette <- if (n_conds <= 2) c("#3498db", "#e74c3c")
-    else RColorBrewer::brewer.pal(max(3, n_conds), "Set2")[seq_len(n_conds)]
+    else get_expanded_palette(n_conds)
     subtitle_str <- paste("Condition:", paste(levels(df$Condition), collapse = " + "),
                           "| Cell type:", vals$ts_active_celltype)
     
@@ -4727,9 +4729,15 @@ server <- function(input, output, session) {
       f_parts <- sapply(filters_to_show, function(f) { val_str <- paste(head(f$vals, 2), collapse=","); if(length(f$vals)>2) val_str <- paste0(val_str, "..."); paste0(f$col, "=(", val_str, ")") })
       filter_str <- paste("Global Filters:", paste(f_parts, collapse="; "))
     }
+    # Use the app's 51-colour distinct palette, NOT scale_fill_brewer("Set2"):
+    # Set2 has only 8 colours, so with >8 comparison groups every group past the
+    # 8th got an NA fill and its bars were drawn invisible (the reported
+    # "functions with no bar", e.g. IL2_STAT5_SIGNALING in a 16-cell-type run).
+    grp_levels    <- sort(unique(as.character(plot_df_filtered$Group)))
+    cocoa_palette <- setNames(get_expanded_palette(length(grp_levels)), grp_levels)
     p <- ggplot(plot_df_filtered, aes(x = NLP, y = reorder(Pathway, NLP), fill = Group)) +
       geom_col(position = position_dodge(width = 0.8), width = 0.7, alpha = 0.8) +
-      scale_fill_brewer(palette = "Set2") +
+      scale_fill_manual(values = cocoa_palette) +
       labs(title = paste("Co-regulation:", gene_to_show),
            subtitle = paste0("Comparison: ", vals$analysis_meta$col, "\n", filter_str),
            x = "-log10(Adjusted P-Value)", y = NULL) +
