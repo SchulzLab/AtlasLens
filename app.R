@@ -431,7 +431,12 @@ load_and_process_seurat_worker <- function(file_path, cache_dir) {
         
         # Check for either umap or scVI
         if ("umap" %in% names(seurat_obj@reductions) || "scVI" %in% names(seurat_obj@reductions)) {
-          dataset_hash <- digest(cached_path, algo="md5")
+          # Hash the object's shape (cells x genes x metadata columns) - the SAME
+          # formula as the fresh-load branch below - so a given dataset gets one
+          # stable hash regardless of whether it came from cache or was processed
+          # fresh. (Previously this hashed the cache path, yielding a different
+          # hash than the fresh path and desyncing the on-disk analysis caches.)
+          dataset_hash <- digest(paste(ncol(seurat_obj), nrow(seurat_obj), colnames(seurat_obj@meta.data), collapse = "_"), algo = "md5")
           return(list(data = seurat_obj, error = NULL, hash = dataset_hash, msg = "Loaded cached processed data."))
         }
       }, error = function(e) unlink(cached_path))
@@ -1330,7 +1335,7 @@ generate_dea_script <- function(comparison_meta, filter_list,
     "Seurat::Idents(seurat_obj) <- seurat_obj@meta.data[[meta_col]]",
     "seurat_obj <- Seurat::NormalizeData(seurat_obj, verbose = FALSE)",
     "markers <- Seurat::FindMarkers(seurat_obj,",
-    "  ident.1 = group1, ident.2 = group2,  # matches AtlasLens: +log2FC = higher in group1",
+    "  ident.1 = group2, ident.2 = group1,  # matches AtlasLens: +log2FC = higher in group2 (comparison)",
     "  test.use = 'wilcox', use_presto = TRUE,",
     "  # logfc.threshold = 0 returns all tested genes; fc_thr is applied below",
     "  # only to flag significance (matches the AtlasLens in-app behaviour).",
@@ -3074,11 +3079,12 @@ server <- function(input, output, session) {
   observeEvent(input$ts_show_plot, {
     vals$ts_active_condition <- input$ts_condition
     vals$ts_active_celltype  <- input$ts_celltype
-    # Numeric sort so timepoints like 7, 14, 28, 105 order naturally
-    # instead of lexically.
+    # Chronological order via sort_timepoints (numeric like 7/14/105,
+    # embedded-number like Day_3, or ordinal labels). This vector is used
+    # directly as the x-axis factor levels in the per-gene Time Series plots,
+    # so plain lexical sort() would mis-order string timepoints.
     tps <- input$ts_selected_tps
-    num_tps <- suppressWarnings(as.numeric(tps))
-    vals$ts_active_tps <- if (!anyNA(num_tps)) tps[order(num_tps)] else sort(tps)
+    vals$ts_active_tps <- sort_timepoints(tps)
     # Translate the "All genes (heatmap)" sentinel into all-genes mode and
     # strip it from the active gene list so downstream code never sees it.
     sel <- input$ts_gene
@@ -3547,7 +3553,7 @@ server <- function(input, output, session) {
     df <- data.frame(
       Expression = as.numeric(expr),
       Timepoint  = factor(sub_obj@meta.data[[r$timepoint]], levels = vals$ts_active_tps),
-      Condition  = factor(cond_vec, levels = conditions_use)
+      Condition  = factor(cond_vec, levels = conditions_to_use)
     )
     
     n_conds <- length(levels(df$Condition))
@@ -3615,7 +3621,7 @@ server <- function(input, output, session) {
     df <- data.frame(
       Expression = expr,
       Timepoint  = factor(sub_obj@meta.data[[r$timepoint]], levels = vals$ts_active_tps),
-      Condition  = factor(cond_vec, levels = conditions_use)
+      Condition  = factor(cond_vec, levels = conditions_to_use)
     )
     
     n_conds <- length(levels(df$Condition))
@@ -3707,7 +3713,7 @@ server <- function(input, output, session) {
     df <- data.frame(
       Expression = expr,
       Timepoint  = factor(sub_obj@meta.data[[r$timepoint]], levels = vals$ts_active_tps),
-      Condition  = factor(cond_vec, levels = conditions_use)
+      Condition  = factor(cond_vec, levels = conditions_to_use)
     )
     
     summary_df <- df %>%
@@ -3820,20 +3826,24 @@ server <- function(input, output, session) {
   # three times. The cache is per-session, bounded, and implicitly invalidated
   # when dataset_hash changes (new dataset / biomaRt conversion / ID toggle).
   expr_row_cache <- new.env(parent = emptyenv())
+  # Insertion order (oldest first) so eviction is true FIFO. ls() returns keys
+  # alphabetically, not by age, so evicting ls()[1] dropped an arbitrary entry
+  # rather than the oldest - this vector tracks the real order.
+  expr_row_order <- character(0)
   get_expr_row <- function(gene) {
     key <- paste0(vals$dataset_hash %||% "na", "|", gene)
     hit <- expr_row_cache[[key]]
     if (!is.null(hit)) return(hit)
     row <- GetAssayData(vals$data, layer = "data")[gene, ]
-    # if (length(ls(expr_row_cache, all.names = TRUE)) >= 16L) {
-    #   rm(list = ls(expr_row_cache, all.names = TRUE), envir = expr_row_cache)
-    # }
-    #Shamim
-    if (length(ls(expr_row_cache, all.names = TRUE)) >= 16L) {
-      oldest <- ls(expr_row_cache, all.names = TRUE)[1]
-      rm(list = oldest, envir = expr_row_cache)
+    if (length(expr_row_order) >= 16L) {
+      oldest <- expr_row_order[1]
+      if (exists(oldest, envir = expr_row_cache, inherits = FALSE)) {
+        rm(list = oldest, envir = expr_row_cache)
+      }
+      expr_row_order <<- expr_row_order[-1]
     }
     assign(key, row, envir = expr_row_cache)
+    expr_row_order <<- c(expr_row_order, key)
     row
   }
   
