@@ -3280,7 +3280,7 @@ server <- function(input, output, session) {
     }
     # Show relative (z-scored) expression so the heatmap reflects temporal
     # SHAPE rather than absolute level; diverging scale centred at 0.
-    fill_label   <- "Z-score\n(Relative)"
+    fill_label   <- "Z-score"
     caption_str  <- "Relative expression (Z-score) per gene at each timepoint; genes grouped by temporal pattern (k-means)."
     midpoint_val <- 0
     
