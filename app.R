@@ -338,15 +338,19 @@ sort_timepoints <- function(tps) {
 # org.*.eg.db annotation package.
 SUPPORTED_SPECIES <- c("Homo sapiens", "Mus musculus", "Danio rerio")
 
-# Map however a curator names a species in landing_config.json (scientific name,
-# common name, or short code) onto one canonical SUPPORTED_SPECIES value. Returns
-# NA_character_ when the input is empty or unrecognized, so callers fall back to
-# auto-detection.
+# Map however a curator picks a species in landing_config.json onto one canonical
+# SUPPORTED_SPECIES value. Accepts the numbered codes the config lists ("1"/"2"/
+# "3" - the typo-proof path), the scientific name, a common name, or a short code.
+# Returns NA_character_ when the input is empty or unrecognized, so callers fall
+# back to auto-detection. The numeric codes MUST stay in sync with the
+# "_species_options" block in landing_config.json.
 normalize_species <- function(x) {
   if (is.null(x) || length(x) == 0) return(NA_character_)
   key <- tolower(trimws(as.character(x)[1]))
   if (is.na(key) || !nzchar(key)) return(NA_character_)
   aliases <- c(
+    # Numbered choices from landing_config.json's _species_options.
+    "1" = "Homo sapiens", "2" = "Mus musculus", "3" = "Danio rerio",
     "homo sapiens" = "Homo sapiens", "human" = "Homo sapiens",
     "hsapiens" = "Homo sapiens", "h. sapiens" = "Homo sapiens", "hs" = "Homo sapiens",
     "mus musculus" = "Mus musculus", "mouse" = "Mus musculus",
@@ -445,7 +449,13 @@ load_and_process_seurat_worker <- function(file_path, cache_dir) {
     if (!file.exists(file_path)) return(list(data = NULL, error = paste("File not found:", file_path), hash = NULL))
     
     if (grepl("\\.qs$", file_path)) { seurat_obj <- qs::qread(file_path) } else { seurat_obj <- readRDS(file_path) }
-    gc() 
+    # Migrate objects saved under an older SeuratObject so newer Assay slots
+    # (e.g. "assay.orig") exist; otherwise validObject() fails on the first
+    # subset/GetAssayData. Keep the original if migration errors.
+    seurat_obj <- tryCatch(
+      suppressWarnings(suppressMessages(UpdateSeuratObject(seurat_obj))),
+      error = function(e) seurat_obj)
+    gc()
     
     if (ncol(seurat_obj@meta.data) > 0) {
       seurat_obj@meta.data[] <- lapply(seurat_obj@meta.data, function(x) {
@@ -952,7 +962,7 @@ create_dea_volcano_plot <- function(dea_results, highlight_gene = NULL, p_thresh
     scale_color_manual(values = c("TRUE" = "#e74c3c", "FALSE" = "#bdc3c7"),
                        breaks = c("TRUE", "FALSE"),
                        labels = c("TRUE" = "Selected range (significant)", "FALSE" = "Not significant"),
-                       name = sprintf("Selected range (significant)\nadj. p < %.3g & |log2FC| >= %.3g", p_threshold, logfc_threshold)) +
+                       name = NULL) +
     geom_text_repel(aes(label = Label), max.overlaps = 20, box.padding = 0.5, na.rm = TRUE) +
     labs(title = paste0("Volcano Plot: ", dea_results$group1[1], " vs ", dea_results$group2[1]), subtitle = paste0(if(!is.null(highlight_gene) && highlight_gene != "") paste("Highlighted Gene:", highlight_gene) else "All Genes", "\n", filter_str), x = "Log2 Fold Change", y = "-log10(Adj. P-Value)") +
     theme_minimal(base_size = 14) + theme(plot.title = element_text(face = "bold"), legend.position = "right")
@@ -1006,10 +1016,12 @@ build_expression_umap <- function(df, gene_name, expr, limits = NULL, raster_dpi
 # information"). No upload and no in-app editor - the file is read once at
 # startup. Expected schema (all fields optional):
 #   { "introduction": "...", "dataset_information": "...", "species": "..." }
-# The optional "species" field (e.g. "Homo sapiens", "Mus musculus", "Danio
-# rerio", or a common name such as "zebrafish") overrides automatic species
-# detection wherever the app needs it (GO enrichment, Ensembl->symbol mapping,
-# Hallmark gene sets). Leave it empty to auto-detect from the gene names.
+# The optional "species" field overrides automatic species detection wherever
+# the app needs it (GO enrichment, Ensembl->symbol mapping, Hallmark gene sets).
+# Curators set it to a numbered code from the config's "_species_options" block
+# ("1" = Homo sapiens, "2" = Mus musculus, "3" = Danio rerio) - typo-proof - but
+# a full/common name ("zebrafish") is still accepted. Leave it empty to
+# auto-detect from the gene names.
 # Search order: $ATLASLENS_LANDING_CONFIG, then landing_config.json in the
 # working directory, then app/landing_config.json. Returns NULL if none is found
 # or the file can't be parsed (the Introduction tab then renders nothing).
@@ -1600,6 +1612,17 @@ default_load <- list(data = NULL, error = "No data loaded.", hash = NULL)
 if (!is.null(DEFAULT_DATA_PATH) && file.exists(DEFAULT_DATA_PATH)) {
   tryCatch({
     seurat_obj <- readRDS(DEFAULT_DATA_PATH)
+    # Objects saved under an older SeuratObject lack newer Assay slots (e.g.
+    # "assay.orig"). The installed SeuratObject's Assay class definition expects
+    # them, so validObject() fails on the first subset / [[<- / GetAssayData,
+    # crashing DEA "Single Gene Expression", GeneCOCOA and the Time-Series
+    # heatmap with: invalid class "Assay" object: slots in class definition but
+    # not in object: "assay.orig". UpdateSeuratObject() migrates the object to
+    # the current class definitions. Keep the original if migration itself errors
+    # so the app still loads.
+    seurat_obj <- tryCatch(
+      suppressWarnings(suppressMessages(UpdateSeuratObject(seurat_obj))),
+      error = function(e) seurat_obj)
     if (!"RNA" %in% names(seurat_obj@assays)) { default_assay <- DefaultAssay(seurat_obj); seurat_obj[["RNA"]] <- seurat_obj[[default_assay]] }
     DefaultAssay(seurat_obj) <- "RNA"
     if (inherits(seurat_obj[["RNA"]], "Assay5")) seurat_obj[["RNA"]] <- JoinLayers(seurat_obj[["RNA"]])
@@ -2239,7 +2262,7 @@ ui <- navbarPage(
                                           div(class = "section-header", icon("layer-group"), " 3. Select Metadata"), tags$label("Metadata Column:", style = "font-weight: bold;"), info_icon("Choose the column defining conditions."), selectInput("dea_meta_col", NULL, choices = NULL), hr(),
                                           div(class = "section-header", icon("code-branch"), " 4. Choose Two Submetadata"), tags$label("Submetadata 1 (Reference):", style = "font-weight: bold;"), selectInput("dea_group1", NULL, choices = NULL), tags$label("Submetadata 2 (Comparison):", style = "font-weight: bold;", style = "margin-top: 10px;"), selectInput("dea_group2", NULL, choices = NULL), uiOutput("dea_cell_count_ui"), hr(), 
                                           div(class = "section-header", icon("cogs"), " 5. Options"),
-                                          checkboxInput("dea_show_significant", "Show significant genes only", value = FALSE),
+                                          checkboxInput("dea_show_significant", "Show selected range only", value = FALSE),
                                           tags$label("Adjusted P-value threshold:", style = "font-weight: bold;"),
                                           info_icon("Genes with p_val_adj below this (and |log2FC| at or above the cutoff below) are flagged as selected range (significant) in the results table and shown as red points on the volcano. Type to override."),
                                           numericInput("dea_p_threshold", NULL,
@@ -2318,7 +2341,7 @@ ui <- navbarPage(
                               # --- Ontology ---
                               div(class = "section-header", icon("sitemap"), " 4. GO Ontology"),
                               selectInput("go_ontology", "Ontology:", choices = c("Biological Process" = "BP", "Molecular Function" = "MF", "Cellular Component" = "CC"), selected = "BP"),
-                              helpText("Gene-ID type is detected automatically. Species comes from the landing_config.json \"species\" field when set (e.g. \"Homo sapiens\", \"Mus musculus\", \"Danio rerio\"/\"zebrafish\"); otherwise it is auto-detected from your genes."),
+                              helpText("Gene-ID type is detected automatically. Species comes from the landing_config.json \"species\" field when set (enter 1 = human, 2 = mouse, 3 = zebrafish); otherwise it is auto-detected from your genes."),
                               # hr()),
                               # # --- Run button ---
                               # br(),
@@ -3729,9 +3752,23 @@ server <- function(input, output, session) {
     else get_expanded_palette(n_conds)
     subtitle_str <- paste("Condition:", paste(levels(df$Condition), collapse = " + "),
                           "| Cell type:", vals$ts_active_celltype)
-    
+
+    # A condition present at only one timepoint (typically the auto-included
+    # control, often collected at baseline only) cannot form a line - it would be
+    # a lone dot. Draw those as a horizontal dashed reference line at their mean
+    # value across the whole x-range, while still showing the dot + error bar at
+    # the real timepoint. Multi-timepoint conditions are unaffected (ref_df is
+    # empty for them, so the geom_hline layer draws nothing).
+    cond_tp_counts  <- table(summary_df$Condition)
+    single_tp_conds <- names(cond_tp_counts)[cond_tp_counts == 1]
+    ref_df <- summary_df[summary_df$Condition %in% single_tp_conds, , drop = FALSE]
+
     ggplot(summary_df,
            aes(x = Timepoint, y = mean_expr, group = Condition, color = Condition)) +
+      geom_hline(data = ref_df,
+                 aes(yintercept = mean_expr, color = Condition),
+                 inherit.aes = FALSE, linetype = "dashed",
+                 linewidth = 0.9, alpha = 0.6, show.legend = FALSE) +
       geom_line(linewidth = 1.2) +
       geom_point(aes(fill = Condition), size = 4, shape = 21,
                  color = "white", stroke = 1.5) +
@@ -5168,7 +5205,7 @@ server <- function(input, output, session) {
     } else if (vals$go_is_analyzing) {
       actionButton("go_run_busy", "Processing...", class = "btn-warning btn-block btn-lg disabled", icon = icon("spinner", class = "fa-spin"))
     } else {
-      actionButton("go_run_analysis", "Run GO Enrichment", class = "btn-success btn-block btn-lg", icon = icon("play-circle"), style = "font-weight: bold;")
+      actionButton("go_run_analysis", "Run GO Enrichment", class = "btn-primary btn-block btn-lg", icon = icon("play-circle"), style = "font-weight: bold;")
     }
   })
   

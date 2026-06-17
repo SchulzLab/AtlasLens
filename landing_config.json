@@ -1,5 +1,10 @@
 {
-  "_instructions": "AtlasLens landing-page text. Fill in the fields below, save, and restart the app. Leave a field as \"\" (empty) to hide that section on the Introduction tab. This file is read once at startup; there is no in-app editor. The _instructions key is ignored by the app. Set \"species\" to your dataset's organism (\"Homo sapiens\", \"Mus musculus\", or \"Danio rerio\"; common names like \"human\", \"mouse\", \"zebrafish\" also work) so GO enrichment, Ensembl-to-symbol mapping, and Hallmark gene sets use the right annotations. Leave \"species\" as \"\" to auto-detect it from the gene names.",
+  "_instructions": "AtlasLens landing-page text. Fill in the fields below, save, and restart the app. Leave a field as \"\" (empty) to hide that section on the Introduction tab. This file is read once at startup; there is no in-app editor. Keys starting with \"_\" are documentation and are ignored by the app. For \"species\", enter the NUMBER of your organism from _species_options below (e.g. \"1\") so GO enrichment, Ensembl-to-symbol mapping, and Hallmark gene sets use the right annotations. Leave \"species\" as \"\" to auto-detect it from the gene names. (Typing the full name still works if you prefer.)",
+  "_species_options": {
+    "1": "Homo sapiens (human)",
+    "2": "Mus musculus (mouse)",
+    "3": "Danio rerio (zebrafish)"
+  },
   "introduction": "",
   "dataset_information": "",
   "species": ""
