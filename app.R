@@ -1775,6 +1775,17 @@ if (!is.null(DEFAULT_DATA_PATH) && file.exists(DEFAULT_DATA_PATH)) {
     # into this handler's frame and the failure would be silently swallowed.
     msg <- conditionMessage(e)
     message("Pre-load: ERROR during dataset load: ", msg)
+    # Turn a raw S4 validity error (malformed / version-incompatible Seurat
+    # object) into a clear, actionable message instead of a cryptic
+    # "invalid class ... slots in class definition but not in object" string.
+    if (grepl("invalid class|slots in class definition|validObject|assay",
+              msg, ignore.case = TRUE)) {
+      msg <- paste0(
+        "This dataset could not be loaded because its Seurat object structure ",
+        "is invalid or was built under an incompatible Seurat version. ",
+        "Open it in R and re-save it with UpdateSeuratObject(), then point ",
+        "AtlasLens at the re-saved file. (Technical detail: ", msg, ")")
+    }
     default_load <<- list(data = NULL, error = msg, hash = NULL)
   })
 }
@@ -2671,9 +2682,16 @@ server <- function(input, output, session) {
     updateSelectInput(session, "ts_col_timepoint",
                       choices = role_choices_required,
                       selected = roles$timepoint %||% all_meta_cols[1])
+    # Condition is OPTIONAL. When no column is named like a condition
+    # (condition/treatment/group/...), do NOT fall back to the first metadata
+    # column - that is typically orig.ident / a per-sample label that maps to a
+    # single timepoint, which makes the temporal plots collapse to one point.
+    # Default to "(none)" instead, so Time Series runs across all cells of the
+    # chosen celltype over the timepoints. The user can still map a condition
+    # column manually here.
     updateSelectInput(session, "ts_col_condition",
-                      choices = role_choices_required,
-                      selected = roles$condition %||% all_meta_cols[1])
+                      choices = role_choices_optional,
+                      selected = roles$condition %||% "")
     updateSelectInput(session, "ts_col_celltype",
                       choices = role_choices_required,
                       selected = roles$celltype  %||% all_meta_cols[1])
@@ -2975,9 +2993,19 @@ server <- function(input, output, session) {
   observe({
     req(vals$data)
     r <- ts_roles()
-    if (is.null(r$condition)) return()
     meta <- vals$data@meta.data
-    if (!r$condition %in% colnames(meta)) return()
+    if (is.null(r$condition) || !r$condition %in% colnames(meta)) {
+      # No condition column mapped: Time Series runs on every cell of the chosen
+      # celltype across the timepoints, as a single group. A placeholder choice
+      # keeps input$ts_condition truthy so the downstream req()s still fire. The
+      # value is human-readable ("All cells") because it surfaces in plot
+      # subtitles and download filenames; the slice ignores it when condition is
+      # NULL, so it never acts as a real filter.
+      updateSelectInput(session, "ts_condition",
+                        choices = c("All cells"),
+                        selected = "All cells")
+      return()
+    }
     ds_mask <- ts_dataset_filter()
     all_conditions <- sort(unique(as.character(meta[[r$condition]][ds_mask])))
     ctrl <- detect_control_conditions(all_conditions)
@@ -3125,21 +3153,31 @@ server <- function(input, output, session) {
   output$ts_summary_table_ui <- renderUI({
     req(vals$data)
     r <- ts_roles()
-    if (is.null(r$timepoint) || is.null(r$condition)) return(NULL)
     meta <- vals$data@meta.data
-    if (!(r$timepoint %in% colnames(meta)) || !(r$condition %in% colnames(meta))) return(NULL)
+    if (is.null(r$timepoint) || !(r$timepoint %in% colnames(meta))) return(NULL)
+    has_cond <- !is.null(r$condition) && r$condition %in% colnames(meta)
     mask <- ts_dataset_filter() & ts_has_timepoint_mask(meta[[r$timepoint]])
     if (sum(mask) == 0) return(NULL)
     ds_meta <- meta[mask, , drop = FALSE]
-    summary_df <- as.data.frame(table(
-      Condition = ds_meta[[r$condition]],
-      Timepoint = ds_meta[[r$timepoint]]
-    ))
-    summary_df <- summary_df[summary_df$Freq > 0, ]
-    num_tp <- suppressWarnings(as.numeric(as.character(summary_df$Timepoint)))
-    summary_df <- summary_df[order(summary_df$Condition,
-                                   if (!anyNA(num_tp)) num_tp else summary_df$Timepoint), ]
-    colnames(summary_df) <- c(r$condition, r$timepoint, "Cell Count")
+    if (has_cond) {
+      summary_df <- as.data.frame(table(
+        Condition = ds_meta[[r$condition]],
+        Timepoint = ds_meta[[r$timepoint]]
+      ))
+      summary_df <- summary_df[summary_df$Freq > 0, ]
+      num_tp <- suppressWarnings(as.numeric(as.character(summary_df$Timepoint)))
+      summary_df <- summary_df[order(summary_df$Condition,
+                                     if (!anyNA(num_tp)) num_tp else summary_df$Timepoint), ]
+      colnames(summary_df) <- c(r$condition, r$timepoint, "Cell Count")
+    } else {
+      # No condition column: one row per timepoint (cell counts across the
+      # whole celltype-agnostic dataset slice).
+      summary_df <- as.data.frame(table(Timepoint = ds_meta[[r$timepoint]]))
+      summary_df <- summary_df[summary_df$Freq > 0, ]
+      num_tp <- suppressWarnings(as.numeric(as.character(summary_df$Timepoint)))
+      summary_df <- summary_df[order(if (!anyNA(num_tp)) num_tp else summary_df$Timepoint), ]
+      colnames(summary_df) <- c(r$timepoint, "Cell Count")
+    }
     
     title_suffix <- if (isTruthy(input$ts_dataset)) paste("Dataset:", input$ts_dataset)
     else "All cells"
@@ -3166,10 +3204,28 @@ server <- function(input, output, session) {
   ts_data_slice <- reactive({
     req(vals$data, vals$ts_active_condition, vals$ts_active_celltype, vals$ts_active_tps)
     r <- vals$ts_active_roles %||% ts_roles()
-    req(!is.null(r$timepoint), !is.null(r$condition), !is.null(r$celltype))
+    req(!is.null(r$timepoint), !is.null(r$celltype))
     meta    <- vals$data@meta.data
-    
     ds_mask <- ts_dataset_filter()
+
+    # No condition column mapped: treat every cell of the chosen celltype as one
+    # group ("All cells") tracked across the timepoints. cond_vec is returned so
+    # the four plot reactives never index meta[[r$condition]] directly (which
+    # would error when r$condition is NULL).
+    if (is.null(r$condition) || !r$condition %in% colnames(meta)) {
+      mask <- ds_mask &
+        meta[[r$celltype]]  == vals$ts_active_celltype &
+        meta[[r$timepoint]] %in% vals$ts_active_tps
+      if (sum(mask) == 0) return(NULL)
+      sub_obj <- vals$data[, mask]
+      return(list(
+        sub_obj        = sub_obj,
+        conditions_use = "All cells",
+        cond_vec       = rep("All cells", ncol(sub_obj)),
+        r              = r
+      ))
+    }
+
     ds_conds <- unique(as.character(meta[[r$condition]][ds_mask]))
     ctrl <- detect_control_conditions(ds_conds)
     conditions_use <- unique(c(vals$ts_active_condition, ctrl))
@@ -3178,9 +3234,11 @@ server <- function(input, output, session) {
       meta[[r$celltype]]  == vals$ts_active_celltype &
       meta[[r$timepoint]] %in% vals$ts_active_tps
     if (sum(mask) == 0) return(NULL)
+    sub_obj <- vals$data[, mask]
     list(
-      sub_obj        = vals$data[, mask],
+      sub_obj        = sub_obj,
       conditions_use = conditions_use,
+      cond_vec       = as.character(sub_obj@meta.data[[r$condition]]),
       r              = r
     )
   })
@@ -3189,7 +3247,7 @@ server <- function(input, output, session) {
   ts_heatmap_logic <- reactive({
     req(vals$data, vals$ts_active_condition, vals$ts_active_celltype, vals$ts_active_tps)
     r <- vals$ts_active_roles %||% ts_roles()
-    req(!is.null(r$timepoint), !is.null(r$condition), !is.null(r$celltype))
+    req(!is.null(r$timepoint), !is.null(r$celltype))
     
     use_all <- isTRUE(vals$ts_active_all_genes)
     if (!use_all) {
@@ -3551,7 +3609,7 @@ server <- function(input, output, session) {
   ts_plot_logic <- reactive({
     req(vals$data, vals$ts_active_condition, vals$ts_active_celltype, vals$ts_active_gene, vals$ts_active_tps)
     r <- vals$ts_active_roles %||% ts_roles()
-    req(!is.null(r$timepoint), !is.null(r$condition), !is.null(r$celltype))
+    req(!is.null(r$timepoint), !is.null(r$celltype))
     
     # Always include the auto-detected control condition alongside the
     # user-selected condition so the treatment trajectory has a reference.
@@ -3574,7 +3632,7 @@ server <- function(input, output, session) {
     r  <- slice$r
     gene1 <- vals$ts_active_gene[1]
     expr  <- GetAssayData(sub_obj, layer = "data")[gene1, ]
-    cond_vec <- as.character(sub_obj@meta.data[[r$condition]])
+    cond_vec <- slice$cond_vec
     df <- data.frame(
       Expression = as.numeric(expr),
       Timepoint  = factor(sub_obj@meta.data[[r$timepoint]], levels = vals$ts_active_tps),
@@ -3619,7 +3677,7 @@ server <- function(input, output, session) {
     req(vals$data, vals$ts_active_condition, vals$ts_active_celltype,
         vals$ts_active_gene, vals$ts_active_tps)
     r <- vals$ts_active_roles %||% ts_roles()
-    req(!is.null(r$timepoint), !is.null(r$condition), !is.null(r$celltype))
+    req(!is.null(r$timepoint), !is.null(r$celltype))
     
     meta <- vals$data@meta.data
     ds_mask <- ts_dataset_filter()
@@ -3642,7 +3700,7 @@ server <- function(input, output, session) {
     
     gene1 <- vals$ts_active_gene[1]
     expr  <- as.numeric(GetAssayData(sub_obj, layer = "data")[gene1, ])
-    cond_vec <- as.character(sub_obj@meta.data[[r$condition]])
+    cond_vec <- slice$cond_vec
     df <- data.frame(
       Expression = expr,
       Timepoint  = factor(sub_obj@meta.data[[r$timepoint]], levels = vals$ts_active_tps),
@@ -3713,8 +3771,8 @@ server <- function(input, output, session) {
   ts_trend_plot_logic <- reactive({
     req(vals$data, vals$ts_active_condition, vals$ts_active_celltype, vals$ts_active_gene, vals$ts_active_tps)
     r <- vals$ts_active_roles %||% ts_roles()
-    req(!is.null(r$timepoint), !is.null(r$condition), !is.null(r$celltype))
-    
+    req(!is.null(r$timepoint), !is.null(r$celltype))
+
     meta <- vals$data@meta.data
     # ds_mask <- ts_dataset_filter()
     # ds_conds <- unique(as.character(meta[[r$condition]][ds_mask]))
@@ -3734,7 +3792,7 @@ server <- function(input, output, session) {
     r <- slice$r
     
     expr <- as.numeric(GetAssayData(sub_obj, layer = "data")[vals$ts_active_gene[1], ])
-    cond_vec <- as.character(sub_obj@meta.data[[r$condition]])
+    cond_vec <- slice$cond_vec
     df <- data.frame(
       Expression = expr,
       Timepoint  = factor(sub_obj@meta.data[[r$timepoint]], levels = vals$ts_active_tps),
@@ -4677,10 +4735,28 @@ server <- function(input, output, session) {
     # Subset the Seurat object to ONLY the sampled cells (~600), then extract
     # counts from the tiny object. This avoids touching the full 393k-cell
     # sparse matrix and matches the validated v160 approach.
-    obj_subset_small <- obj[, final_cells_to_keep]
-    DefaultAssay(obj_subset_small) <- "RNA"
-    if (inherits(obj_subset_small[["RNA"]], "Assay5")) obj_subset_small[["RNA"]] <- JoinLayers(obj_subset_small[["RNA"]])
-    counts_matrix <- GetAssayData(obj_subset_small, layer = "counts")
+    # Subsetting and reading the assay can fail if the object's Seurat structure
+    # is invalid or was built under an incompatible version (e.g. an Assay
+    # missing the "assay.orig" slot). This runs synchronously, so an unhandled
+    # error here would tear down the whole Shiny session ("the app closes").
+    # Catch it and surface a clear message instead.
+    counts_matrix <- tryCatch({
+      obj_subset_small <- obj[, final_cells_to_keep]
+      DefaultAssay(obj_subset_small) <- "RNA"
+      if (inherits(obj_subset_small[["RNA"]], "Assay5")) obj_subset_small[["RNA"]] <- JoinLayers(obj_subset_small[["RNA"]])
+      GetAssayData(obj_subset_small, layer = "counts")
+    }, error = function(e) e)
+    if (inherits(counts_matrix, "error")) {
+      vals$error_msg <- paste0(
+        "Could not read expression data from this dataset. Its Seurat object ",
+        "structure may be invalid or built under an incompatible Seurat version (",
+        conditionMessage(counts_matrix),
+        "). Re-saving the object with UpdateSeuratObject() usually fixes this.")
+      vals$is_analyzing <- FALSE
+      session$sendCustomMessage("stop_timer", list())
+      shinyjs::hide("cocoa_loading_overlay")
+      return()
+    }
     meta_data_subset <- obj@meta.data[final_cells_to_keep, , drop = FALSE]
     # Log-transform paper-grade mode is currently disabled in the UI; the
     # worker is therefore always called with the fast configuration.
