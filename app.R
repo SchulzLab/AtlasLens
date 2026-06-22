@@ -226,6 +226,23 @@ get_hidden_metadata_columns <- function(seurat_obj) {
        high_cardinality = high_cardinality, non_atomic = non_atomic)
 }
 
+# TRUE if an RNA "data" layer/matrix still holds RAW COUNTS and therefore needs
+# log-normalisation. The decision is made by INSPECTING THE VALUES, not by the
+# presence of a UMAP/PCA reduction: log-normalised expression is log1p(scaled
+# counts) and is essentially all-fractional, so a data layer whose non-zero
+# values are all integers is raw counts. A missing/empty layer also counts as
+# "needs normalisation". Up to 1e5 non-zero values are sampled for speed (raw
+# vs normalised is detectable from any handful of values).
+data_layer_is_raw_counts <- function(dat) {
+  if (is.null(dat)) return(TRUE)
+  xv <- tryCatch(dat@x, error = function(e) NULL)            # sparse dgCMatrix
+  if (is.null(xv)) xv <- tryCatch(as.numeric(dat[dat != 0]), # dense fallback
+                                  error = function(e) NULL)
+  if (is.null(xv) || length(xv) == 0) return(TRUE)
+  if (length(xv) > 100000L) xv <- xv[seq.int(1L, length(xv), length.out = 100000L)]
+  all(xv == round(xv))
+}
+
 # Helper to generate enough distinct colors
 # Heuristically detect the metadata columns that play standard biological
 # roles. Each role is matched by an ordered list of regular expressions and
@@ -473,10 +490,20 @@ load_and_process_seurat_worker <- function(file_path, cache_dir) {
     DefaultAssay(seurat_obj) <- "RNA"
     if (inherits(seurat_obj[["RNA"]], "Assay5")) suppressWarnings({ seurat_obj[["RNA"]] <- JoinLayers(seurat_obj[["RNA"]]) })
     
-    was_processed <- FALSE
-    # If neither umap nor scVI exists, run standard pipeline
-    if (!("umap" %in% names(seurat_obj@reductions)) && !("scVI" %in% names(seurat_obj@reductions))) {
+    # Log-normalise whenever RNA@data still holds raw counts, INDEPENDENT of
+    # whether a UMAP/PCA already exists. (Previously NormalizeData ran only when
+    # there was no umap/scVI, so an object that shipped with a UMAP but raw
+    # counts in @data was never normalised.)
+    rna_dat <- tryCatch(GetAssayData(seurat_obj, assay = "RNA", layer = "data"),
+                        error = function(e) NULL)
+    if (data_layer_is_raw_counts(rna_dat)) {
       seurat_obj <- NormalizeData(seurat_obj, verbose = FALSE); gc()
+    }
+
+    was_processed <- FALSE
+    # Compute a UMAP only if the object doesn't already have one (this is a
+    # separate concern from normalisation, above).
+    if (!("umap" %in% names(seurat_obj@reductions)) && !("scVI" %in% names(seurat_obj@reductions))) {
       seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000, verbose = FALSE); gc()
       seurat_obj <- ScaleData(seurat_obj, features = VariableFeatures(seurat_obj), verbose = FALSE); gc()
       seurat_obj <- RunPCA(seurat_obj, features = VariableFeatures(seurat_obj), verbose = FALSE); gc()
@@ -596,7 +623,6 @@ run_dea_worker <- function(subset_counts, subset_meta, meta_col, group1, group2)
 
 # run_go_worker <- function(gene_list, species, ontology, p_cutoff, q_cutoff,
 #                           mode, key_type) {
-#Shamim
 run_go_worker <- function(gene_list, species, ontology, p_cutoff, q_cutoff,
                           mode, key_type, universe = NULL) {
   org_db <- switch(species,
@@ -620,7 +646,7 @@ run_go_worker <- function(gene_list, species, ontology, p_cutoff, q_cutoff,
     if (length(genes) < 1) return(NULL)
     ego <- clusterProfiler::enrichGO(
       gene          = genes,
-      universe      = universe, #Shamim
+      universe      = universe, 
       OrgDb         = org_db,
       keyType       = key_type,
       ont           = ontology,
@@ -704,7 +730,6 @@ create_go_dotplot <- function(df_list, top_n = 15) {
                            size = Count, color = neglog_padj)) +
     geom_point() +
     #scale_color_viridis_c(option = "viridis", name = "-log10(p.adjust)") +
-    #Shamim
     scale_color_viridis_c(option = "viridis", name = "-log10(p.adjust)",
                           labels = function(x) formatC(x, format = "f", digits = 2)) +
     scale_size_continuous(name = "Gene count", range = c(2, 8)) +
@@ -866,6 +891,32 @@ map_ensembl_to_symbol <- function(ens_ids, species) {
                    "' database, and Ensembl BioMart was unreachable."),
        call. = FALSE)
 }
+
+# --- Isolate worker functions from the global environment --------------------
+# future() serialises every exported global TOGETHER WITH its enclosing
+# environment. These workers are defined at top level, so their environment is
+# the global environment - which also holds the loaded Seurat object (a v5 Assay
+# carrying non-exportable external pointers). Exporting a worker therefore
+# dragged the whole dataset (tens of GiB) into each future, which failed with
+# "non-exportable reference (externalptr)" on multi-GiB globals and made the
+# gene-symbol conversion crawl. Re-home the workers in a private environment
+# that holds ONLY the workers themselves, so nothing else is captured.
+# parent = baseenv() keeps base functions resolvable; every other call inside
+# these workers is pkg::-qualified or a sibling worker (e.g.
+# map_ensembl_to_symbol -> run_biomart_query), which are reachable here.
+local({
+  worker_env <- new.env(parent = baseenv())
+  worker_names <- c("run_dea_worker", "run_cocoa_worker", "run_go_worker",
+                    "run_biomart_query", "map_ensembl_to_symbol")
+  worker_names <- Filter(function(nm) exists(nm, envir = globalenv(), inherits = FALSE),
+                         worker_names)
+  for (nm in worker_names) {
+    f <- get(nm, envir = globalenv())
+    environment(f) <- worker_env
+    assign(nm, f, envir = worker_env)    # so siblings can call each other
+    assign(nm, f, envir = globalenv())   # the global name now points to the re-homed copy
+  }
+})
 
 # Rebuild a Seurat object's RNA assay under new gene names. Cell-level data
 # (metadata, UMAP) is untouched; only the gene identifiers change.
@@ -1243,7 +1294,7 @@ create_multi_gene_dotplot <- function(seurat_obj, genes, group_col,
   long$PctExpr <- mapply(function(g, gr) pct_mat[g, gr], long$Gene, long$Group)
   long$Gene  <- factor(long$Gene,  levels = rev(genes))
   long$Group <- factor(long$Group, levels = group_levels)
-  fill_label <- if (isTRUE(scale_expression)) "Avg expr (z)" else "Avg expr"
+  fill_label <- if (isTRUE(scale_expression)) "Expression z-score" else "Avg expression"
   ggplot(long, aes(x = Group, y = Gene, color = AvgExpr, size = PctExpr)) +
     geom_point() +
     (if (isTRUE(scale_expression)) scale_color_zscore(name = fill_label)
@@ -1645,8 +1696,6 @@ if (!is.null(DEFAULT_DATA_PATH) && file.exists(DEFAULT_DATA_PATH)) {
       cnt <- GetAssayData(seurat_obj, assay = "RNA", layer = "counts")
       dat <- tryCatch(GetAssayData(seurat_obj, assay = "RNA", layer = "data"),
                       error = function(e) NULL)
-      data_equals_counts <- !is.null(dat) && length(cnt@x) == length(dat@x) &&
-        identical(cnt@x, dat@x)
       # If @counts itself already contains non-integer values the object was
       # delivered with normalised counts (e.g. an scVI- or sctransform-
       # integrated object stored that way). Running LogNormalize on top
@@ -1672,8 +1721,8 @@ if (!is.null(DEFAULT_DATA_PATH) && file.exists(DEFAULT_DATA_PATH)) {
         } else {
           message("Pre-load: RNA@counts already-normalised and RNA@data present — leaving RNA@data as-is.")
         }
-      } else if (is.null(dat) || nrow(dat) == 0 || data_equals_counts) {
-        message("Pre-load: RNA@data missing or equal to raw counts — computing manual LogNormalize and injecting into RNA@data ...")
+      } else if (data_layer_is_raw_counts(dat)) {
+        message("Pre-load: RNA@data missing or holds raw counts — computing manual LogNormalize and injecting into RNA@data ...")
         
         t_step <- Sys.time()
         flush.console()
@@ -2337,15 +2386,12 @@ ui <- navbarPage(
                               # --- Thresholds ---
                               div(class = "section-header", icon("sliders-h"), " 3. Thresholds"),
                               #numericInput("go_p_cutoff", "Significance cutoff (adjusted p):", value = 0.05, min = 0, max = 1, step = 0.01),
-                              #Shamim
                               numericInput("go_p_cutoff", "Significance cutoff (adjusted p):", value = 0.05, min = 0, max = 1),
                               helpText("Enter a value between 0 and 1."),
                               #numericInput("go_logfc_cutoff", "Min |log2FC| (gene selection / up-down split):", value = 0.585, min = 0, max = 10, step = 0.1),
-                              #Shamim
                               numericInput("go_logfc_cutoff", "Min |log2FC| (gene selection / up-down split):", value = 0.585, min = 0, max = 10),
                               helpText("Enter a value of 0 or greater."),
                               #numericInput("go_q_cutoff", "Q-value (FDR) cutoff:", value = 0.1, min = 0, max = 1, step = 0.01),
-                              #Shamim
                               numericInput("go_q_cutoff", "Q-value (FDR) cutoff:", value = 0.1, min = 0, max = 1),
                               helpText("Enter a value between 0 and 1."),
                               hr(),
@@ -2358,7 +2404,6 @@ ui <- navbarPage(
                               # br(),
                               # uiOutput("go_run_btn_ui")
                               
-                              #Shamim
                               hr(),
                               # --- Display options ---
                               div(class = "section-header", icon("sliders-h"), " 5. Display Options"),
@@ -2524,7 +2569,7 @@ server <- function(input, output, session) {
     analysis_res = NULL, analysis_meta = NULL, active_filters = list(), error_msg = NULL, is_analyzing = FALSE,
     cocoa_gene_used = NULL, cocoa_filters_used = NULL, 
     #dea_results = NULL, dea_error_msg = NULL, dea_filter_list = list(), dea_is_analyzing = FALSE,
-    dea_results = NULL, dea_error_msg = NULL, dea_filter_list = list(), dea_is_analyzing = FALSE, dea_tested_genes = NULL,#Shamim
+    dea_results = NULL, dea_error_msg = NULL, dea_filter_list = list(), dea_is_analyzing = FALSE, dea_tested_genes = NULL,
     dea_filters_used = NULL, dea_meta_used = NULL, # Add these for plot isolation
     # Custom gene list uploaded into the DEA tab. When non-NULL the volcano
     # plot, results table, and downloads are restricted to these genes. The
@@ -2549,7 +2594,7 @@ server <- function(input, output, session) {
     go_upload_data = NULL,
     # geneCOCOA Ensembl-to-symbol conversion state
     cocoa_is_converting = FALSE,
-    # Gene-identifier toggle (item 5): once biomaRt has converted an Ensembl
+    # Gene-identifier toggle: once biomaRt has converted an Ensembl
     # dataset we keep BOTH objects so the user can flip the displayed identifiers
     # between gene symbols and the original Ensembl IDs. gene_id_convertible is
     # FALSE until a conversion happens (the radio is hidden); gene_id_base_hash is
@@ -2567,7 +2612,7 @@ server <- function(input, output, session) {
       tagList(
         div(style = if (isTRUE(vals$gene_id_convertible)) "color: #27ae60; font-weight: bold; margin-bottom: 10px;" else "color: #27ae60; font-weight: bold; margin-bottom: 20px;",
             icon("check-circle"), " Dataset Ready"),
-        # Gene-identifier toggle (item 5): only shown once biomaRt has produced a
+        # Gene-identifier toggle: only shown once biomaRt has produced a
         # symbol mapping, so both representations of the object are in hand. The
         # swap is handled by observeEvent(input$gene_id_mode); switching back to
         # Ensembl IDs intentionally re-locks the geneCOCOA tab (it needs symbols).
@@ -2634,7 +2679,6 @@ server <- function(input, output, session) {
   })
   
   #observe({ 
-  #Shamim
   observeEvent(vals$data, { 
     req(vals$data); 
     
@@ -2797,7 +2841,7 @@ server <- function(input, output, session) {
   render_gene_info <- function(gene, data) {
     if (gene == "" || is.null(gene) || !(gene %in% rownames(data))) return(NULL)
    # expr <- GetAssayData(data, layer = "data")[gene, ]
-    expr <- get_expr_row(gene)    # uses session cache instead of re-extracting #Shamim
+    expr <- get_expr_row(gene)    # uses session cache instead of re-extracting 
     n_cells <- sum(expr > 0)
     div(class = "gene-info-box", p(icon("check-circle", style = "color: green;"), strong("Selected")), p(style = "margin: 3px 0;", paste0("• Expressing Cells: ", format(n_cells, big.mark=",")))) 
   }
@@ -3199,7 +3243,6 @@ server <- function(input, output, session) {
   # so it scales to tens of thousands of rows without ggplot emitting one
   # polygon per cell).
   
-  #Shamim
   # Shared time series data slice — computed once, reused by all 4 TS plots.
   ts_data_slice <- reactive({
     req(vals$data, vals$ts_active_condition, vals$ts_active_celltype, vals$ts_active_tps)
@@ -3261,7 +3304,6 @@ server <- function(input, output, session) {
     # alongside the user-selected condition. The control reference is
     # required for time-course interpretation of treatment-induced
     # trajectories.
-    #Shamim
     # ds_mask <- ts_dataset_filter()
     # ds_conditions <- unique(as.character(meta[[r$condition]][ds_mask]))
     # ctrl <- detect_control_conditions(ds_conditions)
@@ -3278,7 +3320,6 @@ server <- function(input, output, session) {
     # 
     # sub_obj <- vals$data[, mask]
     
-    #Shamim
     slice <- ts_data_slice(); req(slice)
     sub_obj <- slice$sub_obj
     conditions_to_use <- slice$conditions_use
@@ -3625,7 +3666,6 @@ server <- function(input, output, session) {
     # if (sum(mask) == 0) return(NULL)
     # 
     # sub_obj <- vals$data[, mask]
-    #Shamim
     slice <- ts_data_slice(); req(slice)
     sub_obj        <- slice$sub_obj
     conditions_to_use <- slice$conditions_use
@@ -3681,7 +3721,6 @@ server <- function(input, output, session) {
     
     meta <- vals$data@meta.data
     ds_mask <- ts_dataset_filter()
-    #Shamim
     # ds_conds <- unique(as.character(meta[[r$condition]][ds_mask]))
     # ctrl <- detect_control_conditions(ds_conds)
     # conditions_use <- unique(c(vals$ts_active_condition, ctrl))
@@ -3785,7 +3824,6 @@ server <- function(input, output, session) {
     # if (sum(mask) == 0) return(NULL)
     # 
     # sub_obj <- vals$data[, mask]
-    #Shamim
     slice <- ts_data_slice(); req(slice)
     sub_obj <- slice$sub_obj
     conditions_to_use <- slice$conditions_use
@@ -4600,7 +4638,7 @@ server <- function(input, output, session) {
         return()
       }
       # Keep BOTH representations so the gene-identifier toggle can swap between
-      # them without re-querying biomaRt (item 5). gene_id_base_hash is captured
+      # them without re-querying biomaRt. gene_id_base_hash is captured
       # before the mode suffix so per-mode cache keys stay distinct and stable.
       vals$data_ensembl       <- obj          # original Ensembl-ID object
       vals$data_symbol        <- new_obj      # converted gene-symbol object
@@ -4623,7 +4661,7 @@ server <- function(input, output, session) {
     })
   })
   
-  # Gene-identifier toggle (item 5): flip the active object between the cached
+  # Gene-identifier toggle: flip the active object between the cached
   # gene-symbol and Ensembl-ID representations produced by the biomaRt
   # conversion. Swapping vals$data triggers the on-load observer that rebuilds
   # global_plot_data and every gene/metadata dropdown, so the whole app follows
@@ -4733,8 +4771,8 @@ server <- function(input, output, session) {
     if (length(final_cells_to_keep) == 0) { vals$error_msg <- "No cells remaining after sampling."; vals$is_analyzing <- FALSE; shinyjs::hide("cocoa_loading_overlay"); return() }
     
     # Subset the Seurat object to ONLY the sampled cells (~600), then extract
-    # counts from the tiny object. This avoids touching the full 393k-cell
-    # sparse matrix and matches the validated v160 approach.
+    # counts from the tiny object. This avoids touching the full sparse matrix;
+    # only the small subset is ever sent to the worker.
     # Subsetting and reading the assay can fail if the object's Seurat structure
     # is invalid or was built under an incompatible version (e.g. an Assay
     # missing the "assay.orig" slot). This runs synchronously, so an unhandled
@@ -4887,41 +4925,74 @@ server <- function(input, output, session) {
     }
   )
   
-  observe({ 
+  # Values available for the two DEA groups: the chosen metadata column's
+  # levels, restricted to cells passing the active filters. Shared by the
+  # populating observer below and the two mutual-exclusion observers.
+  dea_available_groups <- reactive({
     req(vals$data, input$dea_meta_col)
     obj <- vals$data
     keep_cells <- rep(TRUE, ncol(obj))
-    for(f in vals$dea_filter_list) { keep_cells <- keep_cells & (obj@meta.data[[f$col]] %in% f$vals) }
-    
-    available_groups <- character(0)
-    if (sum(keep_cells) > 0) { 
-      available_groups <- sort(unique(as.character(obj@meta.data[[input$dea_meta_col]][keep_cells]))) 
-    }
-    
+    for (f in vals$dea_filter_list) keep_cells <- keep_cells & (obj@meta.data[[f$col]] %in% f$vals)
+    if (sum(keep_cells) == 0) return(character(0))
+    sort(unique(as.character(obj@meta.data[[input$dea_meta_col]][keep_cells])))
+  })
+
+  observe({
+    available_groups <- dea_available_groups()
+
     # Handle History Restoration for Groups
     curr_g1 <- isolate(input$dea_group1)
     curr_g2 <- isolate(input$dea_group2)
     selected_g1 <- NULL
     selected_g2 <- NULL
-    
+
     if (!is.null(vals$dea_history_pending)) {
-      if (vals$dea_history_pending$g1 %in% available_groups && vals$dea_history_pending$g2 %in% available_groups) {
-        selected_g1 <- vals$dea_history_pending$g1
-        selected_g2 <- vals$dea_history_pending$g2
-        vals$dea_history_pending <- NULL # Reset when fully applied
-      } else {
-        selected_g1 <- vals$dea_history_pending$g1
-        selected_g2 <- vals$dea_history_pending$g2
-      }
+      selected_g1 <- vals$dea_history_pending$g1
+      selected_g2 <- vals$dea_history_pending$g2
+      # Reset only once both restored values are actually available.
+      if (selected_g1 %in% available_groups && selected_g2 %in% available_groups)
+        vals$dea_history_pending <- NULL
     } else {
-      # Default behavior with preservation
-      selected_g1 <- if(!is.null(curr_g1) && curr_g1 %in% available_groups) curr_g1 else NULL 
-      selected_g2 <- if(!is.null(curr_g2) && curr_g2 %in% available_groups) curr_g2 else if(length(available_groups)>1) available_groups[2] else available_groups[1]
+      # Preserve the current picks where still valid.
+      selected_g1 <- if (!is.null(curr_g1) && curr_g1 %in% available_groups) curr_g1 else NULL
+      selected_g2 <- if (!is.null(curr_g2) && curr_g2 %in% available_groups) curr_g2 else NULL
     }
-    
-    updateSelectInput(session, "dea_group1", choices = available_groups, selected = selected_g1)
-    updateSelectInput(session, "dea_group2", choices = available_groups, selected = selected_g2)
+
+    # Reference and Comparison must differ, so each dropdown hides the OTHER's
+    # current value. Fall back to the first two distinct levels.
+    if (length(available_groups) >= 2) {
+      if (is.null(selected_g1) || !selected_g1 %in% available_groups) selected_g1 <- available_groups[1]
+      if (is.null(selected_g2) || !selected_g2 %in% available_groups || selected_g2 == selected_g1)
+        selected_g2 <- setdiff(available_groups, selected_g1)[1]
+      ch1 <- setdiff(available_groups, selected_g2)
+      ch2 <- setdiff(available_groups, selected_g1)
+    } else {
+      ch1 <- available_groups
+      ch2 <- available_groups
+    }
+
+    updateSelectInput(session, "dea_group1", choices = ch1, selected = selected_g1)
+    updateSelectInput(session, "dea_group2", choices = ch2, selected = selected_g2)
   })
+
+  # Keep the two DEA group selectors mutually exclusive: choosing a value in one
+  # removes it from the other, so the same level can never be picked for both
+  # Reference and Comparison. The untouched side keeps its selection when still
+  # valid, so these do not ping-pong - Shiny only re-fires an observer when the
+  # input's value actually changes, and the preserved value does not change.
+  observeEvent(input$dea_group1, {
+    ag <- dea_available_groups(); req(length(ag) >= 2, input$dea_group1)
+    ch2  <- setdiff(ag, input$dea_group1)
+    sel2 <- if (!is.null(input$dea_group2) && input$dea_group2 %in% ch2) input$dea_group2 else ch2[1]
+    updateSelectInput(session, "dea_group2", choices = ch2, selected = sel2)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$dea_group2, {
+    ag <- dea_available_groups(); req(length(ag) >= 2, input$dea_group2)
+    ch1  <- setdiff(ag, input$dea_group2)
+    sel1 <- if (!is.null(input$dea_group1) && input$dea_group1 %in% ch1) input$dea_group1 else ch1[1]
+    updateSelectInput(session, "dea_group1", choices = ch1, selected = sel1)
+  }, ignoreInit = TRUE)
   
   output$dea_filter_controls_ui <- renderUI({ req(vals$data); div(fluidRow(column(6, selectInput("dea_filter_col_select", NULL, choices = get_valid_metadata_columns(vals$data, show_hidden = isTRUE(input$show_hidden_metadata)), width = "100%")), column(6, uiOutput("dea_filter_vals_select_ui"))), actionButton("dea_add_filter", "Add Filter", icon = icon("plus"), class = "btn-xs btn-info", style = "width: 100%; margin-top: 5px;")) })
   output$dea_filter_vals_select_ui <- renderUI({ req(input$dea_filter_col_select, vals$data); selectInput("dea_filter_vals_select", NULL, choices = sort(unique(as.character(vals$data@meta.data[[input$dea_filter_col_select]]))), multiple = TRUE, width = "100%") })
@@ -4964,7 +5035,7 @@ server <- function(input, output, session) {
     shinyjs::show("dea_loading_overlay"); session$sendCustomMessage("start_timer", list(id = "dea_timer"))
     vals$dea_results <- NULL; vals$dea_error_msg <- NULL; vals$dea_is_analyzing <- TRUE
     
-    # === v157 approach: extract sparse matrix + meta on main thread ===
+    # === Extract sparse matrix + meta on the main thread ===
     # Only the small subset gets serialized to the worker, NOT the full Seurat object.
     count_mat <- tryCatch(GetAssayData(obj, layer="counts"), error = function(e) GetAssayData(obj, layer="data"))
     subset_counts <- count_mat[, cells_mask, drop=FALSE]
@@ -5362,7 +5433,7 @@ server <- function(input, output, session) {
                         ontology = ontology, p_cut = p_cut,
                         q_cut = q_cutoff, logfc_cut = fc_cut)
     
-    # Correct background: genes actually tested in DEA, not the whole OrgDb #Shamim
+    # Correct background: genes actually tested in DEA, not the whole OrgDb 
     background_genes <- if (from_dea && !is.null(vals$dea_tested_genes)) {
       vals$dea_tested_genes
     } else {
@@ -5377,14 +5448,13 @@ server <- function(input, output, session) {
     
     future({
       # run_go_worker(gene_list, species, ontology, p_cut, q_cutoff, mode, key_type)
-      #Shamim
       run_go_worker(gene_list, species, ontology, p_cut, q_cutoff, mode, key_type,
                     universe = background_genes)
     }, globals = list(
       run_go_worker = run_go_worker, gene_list = gene_list, species = species,
       ontology = ontology, p_cut = p_cut, q_cutoff = q_cutoff,
       mode = mode, key_type = key_type,
-      background_genes = background_genes  #Shamim
+      background_genes = background_genes  
     ), packages = c("clusterProfiler", "org.Hs.eg.db", "org.Mm.eg.db",
                     "AnnotationDbi", "rrvgo", "GOSemSim"),
     seed = TRUE) %...>% (function(res) {
@@ -5499,7 +5569,6 @@ server <- function(input, output, session) {
   #   create_go_dotplot(dl)
   # }, height = 650)
   
-  #Shamim
   output$go_dotplot <- renderPlot({
     dl <- go_df_list(); req(length(dl) > 0)
     create_go_dotplot(dl, top_n = input$go_top_n %||% 15)
@@ -5577,7 +5646,6 @@ server <- function(input, output, session) {
     content  = function(file) {
       dl <- go_df_list()
       #ggplot2::ggsave(file, create_go_dotplot(dl), width = 12, height = 8, dpi = 300)
-      #Shamim
       ggplot2::ggsave(file, create_go_dotplot(dl, top_n = input$go_top_n %||% 15),
                       width = 12, height = 8, dpi = 300)
     }
