@@ -27,14 +27,11 @@ of analysis tools through a tabbed interface. Heavy computations (differential e
 background workers (via `future` / `promises`), so the interface stays
 responsive, and results are cached on disk (`qs`) for instant retrieval.
 
-The application auto-detects the species
-(human / mouse) from gene-symbol casing or Ensembl ID prefix, automatically
-converts Ensembl IDs to symbols via biomaRt when needed, and auto-detects
-metadata role columns (timepoint, condition, cell type, dataset) so it can
+The application auto-detects metadata role columns (timepoint, condition, cell type, dataset) so it can
 be pointed at any compatible atlas.
 
-The reference dataset is the Tabula Muris atlas; and a complementary acute myocardial
-infarction (AMI) atlas is used to demonstrate the time-series and
+The reference dataset is the Tabula Muris atlas; and a time-resolved whole-lung single-cell atlas of bleomycin-induced lung injury
+and fibrosis is used to demonstrate the time-series and
 condition-specific modules.
 
 ## Features
