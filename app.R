@@ -104,12 +104,33 @@ options(future.globals.maxSize = 800000 * 1024^2)
 # Windows, where future silently runs futures sequentially. Keep the platform
 # check so the app still parallelises (via multisession) on Windows instead of
 # blocking the UI on every geneCOCOA / DEA / GO run.
-if (parallelly::supportsMulticore()) {
+# The future plan can be overridden with the ATLASLENS_FUTURE_PLAN environment
+# variable for platforms where the default crashes (e.g. some macOS / RStudio
+# setups disable forking and fall back to multisession, which serialises globals
+# and has been seen to fail). Accepted values:
+#   "sequential"   - no parallelism; analyses run on the main thread. The most
+#                    portable choice (works on every OS), at the cost of the UI
+#                    being blocked while a long analysis runs.
+#   "multisession" - background R processes (works on Windows too).
+#   "multicore"    - forked workers (Linux/macOS only).
+# Unset -> the platform-aware default (multicore where supported, else multisession).
+ts_plan <- tolower(trimws(Sys.getenv("ATLASLENS_FUTURE_PLAN", "")))
+if (ts_plan == "sequential") {
+  plan(sequential)
+  message("Config: ATLASLENS_FUTURE_PLAN=sequential - analyses run on the main thread (no parallelism).")
+} else if (ts_plan == "multisession") {
+  plan(multisession, workers = 2)
+  message("Config: ATLASLENS_FUTURE_PLAN=multisession (2 workers).")
+} else if (ts_plan == "multicore") {
+  plan(multicore, workers = 4)
+  message("Config: ATLASLENS_FUTURE_PLAN=multicore (4 workers).")
+} else if (parallelly::supportsMulticore()) {
   plan(multicore, workers = 4)
   message("Config: Using multicore futures (4 workers).")
 } else {
   plan(multisession, workers = 2)
-  message("Config: multicore unavailable on this platform; using multisession (2 workers).")
+  message("Config: multicore unavailable on this platform; using multisession (2 workers). ",
+          "Set ATLASLENS_FUTURE_PLAN=sequential if background workers crash.")
 }
 
 # === LOGGING & LOCKING ===
@@ -1103,9 +1124,21 @@ load_landing_config <- function() {
             "' in landing config. Supported: ", paste(SUPPORTED_SPECIES, collapse = ", "),
             ". Falling back to auto-detection.")
   }
+  # Optional explicit Time Series column mapping. A trimmed non-empty string is
+  # returned as-is (validated against the dataset later, in the server); empty
+  # or missing fields become NULL so the app falls back to auto-detection.
+  col <- function(x) {
+    if (is.null(x) || !length(x)) return(NULL)
+    v <- trimws(as.character(x)[1])
+    if (nzchar(v)) v else NULL
+  }
   list(introduction        = pick(cfg$introduction),
        dataset_information = pick(cfg$dataset_information),
-       species             = if (is.na(norm_species)) NULL else norm_species)
+       species             = if (is.na(norm_species)) NULL else norm_species,
+       timeseries_column   = col(cfg$timeseries_column),
+       condition_column    = col(cfg$condition_column),
+       celltype_column     = col(cfg$celltype_column),
+       dataset_column      = col(cfg$dataset_column))
 }
 
 # Parse free-text or uploaded gene list. Genes can be on separate lines, or
@@ -1801,19 +1834,52 @@ if (!is.null(DEFAULT_DATA_PATH) && file.exists(DEFAULT_DATA_PATH)) {
       }
     }
     
-    if (!("umap" %in% names(seurat_obj@reductions))) {
-      message("Pre-load: WARNING — no precomputed UMAP found in object. Running full Seurat UMAP pipeline now; this can take 5-15 minutes for a large dataset. Provide an object with a precomputed 'umap' reduction to skip this step.")
-      message("Pre-load:   step 1/5 NormalizeData ...")
-      seurat_obj <- NormalizeData(seurat_obj, verbose = FALSE)
-      message("Pre-load:   step 2/5 FindVariableFeatures ...")
-      seurat_obj <- FindVariableFeatures(seurat_obj, verbose = FALSE)
-      message("Pre-load:   step 3/5 ScaleData ...")
-      seurat_obj <- ScaleData(seurat_obj, verbose = FALSE)
-      message("Pre-load:   step 4/5 RunPCA ...")
-      seurat_obj <- RunPCA(seurat_obj, verbose = FALSE)
-      message("Pre-load:   step 5/5 RunUMAP ...")
-      seurat_obj <- RunUMAP(seurat_obj, dims = 1:20, verbose = FALSE)
-      message("Pre-load: UMAP computation complete.")
+    # Decide whether to compute a UMAP. The scatter needs a real UMAP, so the
+    # rule is keyed on a UMAP reduction specifically (not just "any reduction"):
+    #   - a "umap" reduction already exists      -> use it, no compute
+    #   - the object has another low-D space     -> run UMAP DIRECTLY on it
+    #     (harmony/scVI/mnn/pca), skipping the slow Normalize -> FindVariableFeatures
+    #     -> Scale -> PCA steps that stalled on large integrated objects
+    #   - the object is genuinely raw            -> full pipeline, as before
+    # This block runs synchronously at startup, so on a large object the app
+    # takes a while to open (watch the Pre-load: log) - it is working, not frozen.
+    # ATLASLENS_AUTOPROCESS=0 skips the no-UMAP computation entirely.
+    reds_present <- names(seurat_obj@reductions)
+    # Match the reduction named EXACTLY "umap" (case-insensitive) - NOT
+    # integration-specific variants like "umap_harmony"/"umap_harmony_EC", which
+    # are not the standard UMAP the scatter expects. If only those exist, fall
+    # through and build a fresh "umap" (the pre-existing behaviour).
+    has_umap     <- any(tolower(reds_present) == "umap")
+    autoproc_off <- tolower(trimws(Sys.getenv("ATLASLENS_AUTOPROCESS", ""))) %in%
+                    c("0", "false", "no", "off")
+
+    if (has_umap) {
+      message("Pre-load: using existing 'umap' reduction - no reprocessing.")
+    } else if (autoproc_off) {
+      message("Pre-load: no UMAP reduction found, and ATLASLENS_AUTOPROCESS is disabled - ",
+              "skipping. The map view will be unavailable; all analysis tabs still work.")
+    } else {
+      # No standard "umap" reduction -> compute one EXACTLY as earlier versions
+      # did: Normalize -> FindVariableFeatures -> Scale -> PCA -> RunUMAP(dims 1:20)
+      # on the fresh PCA. (Running UMAP straight off an existing harmony space
+      # gave a different, less-separated layout; this reproduces the old look.)
+      # It runs synchronously, so on a large object the app takes a few minutes
+      # to open - it is working, not frozen. Set ATLASLENS_AUTOPROCESS=0 to skip.
+      message("Pre-load: no 'umap' reduction - computing one ",
+              "(NormalizeData -> FindVariableFeatures -> ScaleData -> RunPCA -> RunUMAP). ",
+              "One-time; can take a few minutes on a large object - it is working, not frozen.")
+      message("Pre-load:   NormalizeData ...");        seurat_obj <- NormalizeData(seurat_obj, verbose = FALSE)
+      message("Pre-load:   FindVariableFeatures ...");  seurat_obj <- FindVariableFeatures(seurat_obj, verbose = FALSE)
+      message("Pre-load:   ScaleData ...");             seurat_obj <- ScaleData(seurat_obj, verbose = FALSE)
+      message("Pre-load:   RunPCA ...");                seurat_obj <- RunPCA(seurat_obj, verbose = FALSE)
+      message("Pre-load:   RunUMAP ...")
+      seurat_obj <- tryCatch(
+        suppressWarnings(RunUMAP(seurat_obj, dims = 1:20, verbose = FALSE)),
+        error = function(e) {
+          message("Pre-load:   RunUMAP failed (", conditionMessage(e), "); the scatter will use PCA.")
+          seurat_obj
+        })
+      message("Pre-load: processing complete.")
     }
     seurat_obj <- ensure_qc_columns(seurat_obj)
     dataset_hash <- digest(paste(ncol(seurat_obj), nrow(seurat_obj), colnames(seurat_obj@meta.data), collapse = "_"), algo = "md5")
@@ -2684,11 +2750,36 @@ server <- function(input, output, session) {
     
     # Pre-calculate global plot data for speed
     # Prioritize 'umap' for visualization coordinates. 'scVI' is the latent representation.
-    red_to_use <- if ("umap" %in% names(vals$data@reductions)) "umap" else if ("scVI" %in% names(vals$data@reductions)) "scVI" else "pca"
-    emb <- Embeddings(vals$data, red_to_use)
-    if (ncol(emb) > 2) emb <- emb[, 1:2]
-    colnames(emb) <- c("UMAP_1", "UMAP_2")
-    vals$global_plot_data <- cbind(as.data.frame(emb), vals$data@meta.data)
+    # Pick the best available 2D embedding WITHOUT recomputing: prefer a
+    # UMAP / t-SNE / scVI, then an integration reduction (harmony) or PCA, then
+    # whatever exists. This matches the startup policy of never recomputing when
+    # the object already carries embeddings (e.g. a Harmony-integrated object
+    # with "harmony" + "pca" but no "umap").
+    reds <- names(vals$data@reductions)
+    if (length(reds) == 0) {
+      # No embedding (object had none and auto-processing was off). Leave the
+      # map data empty so the UMAP-based plots simply do not render (they all
+      # req() it); the gene/metadata selectors below still populate, so the
+      # analysis tabs work normally.
+      vals$global_plot_data <- NULL
+      showNotification(
+        "This dataset has no UMAP/PCA embedding, so the map view is unavailable. The DEA, COCOA, GO and Time Series tabs work normally. Provide an object with a reduction, or set ATLASLENS_AUTOPROCESS=1.",
+        type = "warning", duration = 12)
+    } else {
+      # The exact "umap" reduction (the standard UMAP, freshly built at startup if
+      # it was missing) wins over integration variants like "umap_harmony".
+      pref <- c(reds[tolower(reds) == "umap"],
+                grep("umap", reds, ignore.case = TRUE, value = TRUE),
+                grep("tsne", reds, ignore.case = TRUE, value = TRUE),
+                grep("scvi", reds, ignore.case = TRUE, value = TRUE),
+                intersect(c("harmony", "pca"), reds),
+                reds)
+      red_to_use <- pref[[1]]
+      emb <- Embeddings(vals$data, red_to_use)
+      if (ncol(emb) > 2) emb <- emb[, 1:2]
+      colnames(emb) <- c("UMAP_1", "UMAP_2")
+      vals$global_plot_data <- cbind(as.data.frame(emb), vals$data@meta.data)
+    }
     
     all_genes <- rownames(vals$data); updateSelectizeInput(session, "explore_gene", choices = all_genes, selected = "", server = TRUE); updateSelectizeInput(session, "analysis_gene", choices = all_genes, selected = "", server = TRUE); updateSelectizeInput(session, "dea_gene", choices = all_genes, selected = character(0), server = TRUE); valid_cols <- get_valid_metadata_columns(vals$data, show_hidden = isTRUE(input$show_hidden_metadata));
     dataset_col_explore <- if("Celltype_annotated" %in% valid_cols) "Celltype_annotated" else if("Condition" %in% valid_cols) "Condition" else valid_cols[1];
@@ -2717,9 +2808,28 @@ server <- function(input, output, session) {
     # get_valid_metadata_columns().
     all_meta_cols <- colnames(vals$data@meta.data)
     roles <- detect_role_columns(vals$data@meta.data)
-    # Gate the whole Time Series tab on whether a genuine timepoint column was
-    # found. When none exists, the tab shows an explanatory message and its
-    # controls are disabled rather than silently analysing an arbitrary column.
+    # Curator-declared columns in landing_config.json take precedence over the
+    # name/value heuristics. This is the reliable path when auto-detection fails
+    # on a new dataset: the curator names the timepoint column and the tab uses
+    # it directly. A declared column that is not actually present is ignored
+    # (auto-detection stands) and a warning flags the likely typo.
+    cfg <- vals$landing_config
+    use_cfg_col <- function(role_val, cfg_col, label) {
+      if (is.null(cfg_col)) return(role_val)
+      if (cfg_col %in% all_meta_cols) return(cfg_col)
+      showNotification(sprintf(
+        "landing_config.json: %s column '%s' is not in this dataset's metadata - using auto-detection instead.",
+        label, cfg_col), type = "warning", duration = 8)
+      role_val
+    }
+    roles$timepoint <- use_cfg_col(roles$timepoint, cfg$timeseries_column, "time-series")
+    roles$condition <- use_cfg_col(roles$condition, cfg$condition_column,  "condition")
+    roles$celltype  <- use_cfg_col(roles$celltype,  cfg$celltype_column,   "celltype")
+    roles$dataset   <- use_cfg_col(roles$dataset,   cfg$dataset_column,    "dataset")
+    # Gate the whole Time Series tab on whether a timepoint column was found
+    # (declared or auto-detected). When none exists, the tab shows an
+    # explanatory message and its controls are disabled rather than silently
+    # analysing an arbitrary column.
     vals$ts_timepoint_available <- !is.null(roles$timepoint)
     role_choices_required <- all_meta_cols
     role_choices_optional <- c("(none)" = "", all_meta_cols)
@@ -3026,7 +3136,9 @@ server <- function(input, output, session) {
     if (is.null(r$dataset) || !isTruthy(input$ts_dataset))
       return(rep(TRUE, nrow(meta)))
     if (!r$dataset %in% colnames(meta)) return(rep(TRUE, nrow(meta)))
-    meta[[r$dataset]] == input$ts_dataset
+    # %in% (not ==) so an NA in the dataset column yields FALSE, never NA - an
+    # NA in the mask would later make sum(mask) NA and crash `if (sum(mask)==0)`.
+    meta[[r$dataset]] %in% input$ts_dataset
   }
   
   # Dataset -> Condition cascade
@@ -3140,9 +3252,9 @@ server <- function(input, output, session) {
       mask <- mask & meta[[r$condition]] %in% conditions_for_tps
     }
     if (!is.null(r$celltype) && r$celltype %in% colnames(meta))
-      mask <- mask & meta[[r$celltype]]  == input$ts_celltype
+      mask <- mask & meta[[r$celltype]] %in% input$ts_celltype
     
-    if (sum(mask) == 0)
+    if (sum(mask, na.rm = TRUE) == 0)
       return(p(style = "color: #e67e22;", "No cells found for this combination."))
     
     available_tps <- unique(as.character(meta[[r$timepoint]][mask]))
@@ -3201,7 +3313,7 @@ server <- function(input, output, session) {
     if (is.null(r$timepoint) || !(r$timepoint %in% colnames(meta))) return(NULL)
     has_cond <- !is.null(r$condition) && r$condition %in% colnames(meta)
     mask <- ts_dataset_filter() & ts_has_timepoint_mask(meta[[r$timepoint]])
-    if (sum(mask) == 0) return(NULL)
+    if (sum(mask, na.rm = TRUE) == 0) return(NULL)
     ds_meta <- meta[mask, , drop = FALSE]
     if (has_cond) {
       summary_df <- as.data.frame(table(
@@ -3257,9 +3369,9 @@ server <- function(input, output, session) {
     # would error when r$condition is NULL).
     if (is.null(r$condition) || !r$condition %in% colnames(meta)) {
       mask <- ds_mask &
-        meta[[r$celltype]]  == vals$ts_active_celltype &
+        meta[[r$celltype]] %in% vals$ts_active_celltype &
         meta[[r$timepoint]] %in% vals$ts_active_tps
-      if (sum(mask) == 0) return(NULL)
+      if (sum(mask, na.rm = TRUE) == 0) return(NULL)
       sub_obj <- vals$data[, mask]
       return(list(
         sub_obj        = sub_obj,
@@ -3274,9 +3386,9 @@ server <- function(input, output, session) {
     conditions_use <- unique(c(vals$ts_active_condition, ctrl))
     mask <- ds_mask &
       meta[[r$condition]] %in% conditions_use &
-      meta[[r$celltype]]  == vals$ts_active_celltype &
+      meta[[r$celltype]] %in% vals$ts_active_celltype &
       meta[[r$timepoint]] %in% vals$ts_active_tps
-    if (sum(mask) == 0) return(NULL)
+    if (sum(mask, na.rm = TRUE) == 0) return(NULL)
     sub_obj <- vals$data[, mask]
     list(
       sub_obj        = sub_obj,
@@ -3871,7 +3983,7 @@ server <- function(input, output, session) {
       geom_errorbar(aes(ymin = mean_expr - se, ymax = mean_expr + se),
                     width = 0.2, alpha = 0.7) +
       geom_text(aes(label = paste0("n=", n_cells)),
-                vjust = -1.5, size = 3, color = "#666", show.legend = FALSE) +
+                vjust = -1.5, size = 3, color = "#666666", show.legend = FALSE) +
       scale_color_manual(values = setNames(cond_palette, levels(df$Condition))) +
       scale_fill_manual (values = setNames(cond_palette, levels(df$Condition))) +
       labs(
