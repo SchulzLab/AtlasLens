@@ -5,6 +5,11 @@
     "2": "Mus musculus (mouse)",
     "3": "Danio rerio (zebrafish)"
   },
+  "_column_mapping": "Optional. Name the metadata columns AtlasLens should use in the Time Series tab, so it does not have to guess them. Leave \"\" to auto-detect. 'timeseries_column' is your timepoint/day column (e.g. \"Day\" or \"TimeSeriesInfo\") - set this if the Time Series tab fails to find your timepoints. 'condition_column' splits trajectories into groups (leave \"\" to treat all cells of a cell type as one group). 'celltype_column' and 'dataset_column' are optional. Each value must match a column name in your object's meta.data EXACTLY (case-sensitive); an unknown name is ignored and the app falls back to auto-detection.",
+  "timeseries_column": "",
+  "condition_column": "",
+  "celltype_column": "",
+  "dataset_column": "",
   "introduction": "",
   "dataset_information": "",
   "species": ""
