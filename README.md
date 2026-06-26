@@ -1,4 +1,4 @@
-# AtlasLens
+# AtlasLens: metadata-centric exploration and analysis of single-cell atlases
 
 **The source  code behind the Shiny application for reproducible exploration of single-cell RNA-seq atlases.**
 
@@ -27,16 +27,11 @@ of analysis tools through a tabbed interface. Heavy computations (differential e
 background workers (via `future` / `promises`), so the interface stays
 responsive, and results are cached on disk (`qs`) for instant retrieval.
 
-The application auto-detects the species
-(human / mouse / zebrafish) from gene-symbol casing or Ensembl ID prefix
-(or you can declare it in `landing_config.json`), automatically
-converts Ensembl IDs to symbols via biomaRt when needed, and auto-detects
-metadata role columns (timepoint, condition, cell type, dataset) — which can
-also be declared explicitly in `landing_config.json` — so it can
+The application auto-detects metadata role columns (timepoint, condition, cell type, dataset) so it can
 be pointed at any compatible atlas.
 
-The reference dataset is the Tabula Muris atlas; and a complementary acute myocardial
-infarction (AMI) atlas is used to demonstrate the time-series and
+The reference dataset is the Tabula Muris atlas; and a time-resolved whole-lung single-cell atlas of bleomycin-induced lung injury
+and fibrosis is used to demonstrate the time-series and
 condition-specific modules.
 
 ## Features
@@ -105,13 +100,12 @@ table** generated in-app or a **user-uploaded CSV** (DEA-style: `gene`,
 
 ```
 AtlasLens/
-├── app.R                  # The AtlasLens Shiny application
-├── anndata_to_seurat.R    # Converter: scanpy .h5ad -> Seurat .rds (run separately)
-├──build_seurat_from_files.R 
-├── landing_config.json    # Optional landing-page text, species, and column mapping
-├── Dockerfile
-├── environment.yml
-├── install.R
+├── app.R                        # The AtlasLens Shiny application
+├── anndata_to_seurat.R          # Convert an AnnData (.h5ad) object to a Seurat .rds
+├── build_seurat_from_files.R    # Build a Seurat .rds from raw matrix / metadata files
+├── Dockerfile         
+├── environment.yml     
+├── install.R          
 ├── README.md
 └── .gitignore
 ```
@@ -170,6 +164,22 @@ Gene symbols (or Ensembl IDs  converted on-the-fly via biomaRt) are the row
 names; cell-level metadata columns are used for grouping and filtering. The
 app supports both Seurat v3 / v4 `Assay` and Seurat v5 `Assay5` objects;
 multi-layer v5 objects are joined automatically at startup.
+
+### Preparing a Seurat object
+
+If you do not already have a Seurat `.rds` file, two helper scripts in this
+repository can build one for you:
+
+- **Starting from an AnnData object** (a `.h5ad` file, e.g. exported from
+  Scanpy/Python): use
+  [`anndata_to_seurat.R`](https://github.com/SchulzLab/AtlasLens/blob/main/anndata_to_seurat.R)
+  to convert your AnnData object into a Seurat object and save it as `.rds`.
+- **Starting from raw files** (e.g. a count matrix plus cell/gene metadata):
+  use
+  [`build_seurat_from_files.R`](https://github.com/SchulzLab/AtlasLens/blob/main/build_seurat_from_files.R)
+  to assemble a Seurat object from those files and save it as `.rds`.
+
+Point `DATASET_PATH` (below) at the resulting `.rds` file.
 
 The dataset path is resolved at startup from the `DATASET_PATH` environment
 variable:
