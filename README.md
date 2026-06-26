@@ -100,7 +100,9 @@ table** generated in-app or a **user-uploaded CSV** (DEA-style: `gene`,
 
 ```
 AtlasLens/
-├── app.R               # The AtlasLens Shiny application
+├── app.R                        # The AtlasLens Shiny application
+├── anndata_to_seurat.R          # Convert an AnnData (.h5ad) object to a Seurat .rds
+├── build_seurat_from_files.R    # Build a Seurat .rds from raw matrix / metadata files
 ├── Dockerfile         
 ├── environment.yml     
 ├── install.R          
@@ -162,6 +164,22 @@ Gene symbols (or Ensembl IDs  converted on-the-fly via biomaRt) are the row
 names; cell-level metadata columns are used for grouping and filtering. The
 app supports both Seurat v3 / v4 `Assay` and Seurat v5 `Assay5` objects;
 multi-layer v5 objects are joined automatically at startup.
+
+### Preparing a Seurat object
+
+If you do not already have a Seurat `.rds` file, two helper scripts in this
+repository can build one for you:
+
+- **Starting from an AnnData object** (a `.h5ad` file, e.g. exported from
+  Scanpy/Python): use
+  [`anndata_to_seurat.R`](https://github.com/SchulzLab/AtlasLens/blob/main/anndata_to_seurat.R)
+  to convert your AnnData object into a Seurat object and save it as `.rds`.
+- **Starting from raw files** (e.g. a count matrix plus cell/gene metadata):
+  use
+  [`build_seurat_from_files.R`](https://github.com/SchulzLab/AtlasLens/blob/main/build_seurat_from_files.R)
+  to assemble a Seurat object from those files and save it as `.rds`.
+
+Point `DATASET_PATH` (below) at the resulting `.rds` file.
 
 The dataset path is resolved at startup from the `DATASET_PATH` environment
 variable:
