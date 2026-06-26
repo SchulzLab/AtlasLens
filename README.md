@@ -28,9 +28,11 @@ background workers (via `future` / `promises`), so the interface stays
 responsive, and results are cached on disk (`qs`) for instant retrieval.
 
 The application auto-detects the species
-(human / mouse) from gene-symbol casing or Ensembl ID prefix, automatically
+(human / mouse / zebrafish) from gene-symbol casing or Ensembl ID prefix
+(or you can declare it in `landing_config.json`), automatically
 converts Ensembl IDs to symbols via biomaRt when needed, and auto-detects
-metadata role columns (timepoint, condition, cell type, dataset) so it can
+metadata role columns (timepoint, condition, cell type, dataset) — which can
+also be declared explicitly in `landing_config.json` — so it can
 be pointed at any compatible atlas.
 
 The reference dataset is the Tabula Muris atlas; and a complementary acute myocardial
@@ -103,10 +105,13 @@ table** generated in-app or a **user-uploaded CSV** (DEA-style: `gene`,
 
 ```
 AtlasLens/
-├── app.R               # The AtlasLens Shiny application
-├── Dockerfile         
-├── environment.yml     
-├── install.R          
+├── app.R                  # The AtlasLens Shiny application
+├── anndata_to_seurat.R    # Converter: scanpy .h5ad -> Seurat .rds (run separately)
+├──build_seurat_from_files.R 
+├── landing_config.json    # Optional landing-page text, species, and column mapping
+├── Dockerfile
+├── environment.yml
+├── install.R
 ├── README.md
 └── .gitignore
 ```
@@ -176,6 +181,48 @@ export DATASET_PATH=/path/to/your_integrated_object.rds
 A cache directory for analysis results is created at `~/tmp` (configurable
 via `CACHE_DIR`).
 
+### Converting other formats to a Seurat object
+
+AtlasLens loads a Seurat `.rds`, but you do not have to start from one. Convert
+your data first, then point `DATASET_PATH` at the resulting `.rds`:
+
+- **AnnData / scanpy (`.h5ad`)** — use the bundled `anndata_to_seurat.R`. It
+  reads the file with [anndataR](https://github.com/scverse/anndataR)'s native R
+  reader (no Python required) and writes a Seurat `.rds` with a **classic (v3)
+  assay**, which loads under any Seurat version:
+
+  ```bash
+  # In your own R (requires R >= 4.5 and BiocManager::install(c("anndataR","rhdf5")))
+  Rscript anndata_to_seurat.R  input.h5ad  output.rds
+  ```
+
+  The script copies `obs` to cell metadata, uses `layers['counts']` (or `X`) as
+  the expression matrix, and carries over `obsm` embeddings (`X_umap`, `X_pca`).
+  It prints the resulting assay class — confirm it says `Assay` (v3).
+
+- **Raw / matrix files (10x, CSV, …)** — a companion script that builds a Seurat
+  object from raw input files is available at
+  **[<add GitHub link here>](#)**. Convert with it, then load the `.rds` in
+  AtlasLens the same way.
+
+### Time Series column mapping (optional)
+
+The Time Series tab auto-detects the timepoint, condition, cell-type and dataset
+columns from your metadata. If auto-detection picks the wrong column (or your
+timepoint column has an unusual name), declare it explicitly in
+`landing_config.json` — a declared column always wins, and AtlasLens uses it
+directly:
+
+```json
+"timeseries_column": "Day",
+"condition_column": "",
+"celltype_column": "celltype",
+"dataset_column": ""
+```
+
+Leave a field as `""` to keep auto-detecting it. Names are case-sensitive and
+must match a column in the object's `meta.data`.
+
 ## Running AtlasLens
 
 ```bash
@@ -221,9 +268,25 @@ repeating an analysis with the same settings is instant.
   `docker run` via `-e DATASET_PATH=...`).
 - **Analyses run slowly on Windows.** The `multicore` plan is Unix-only; use
   Linux / macOS, or expect sequential fallback.
+- **Background analyses crash** (e.g. on some macOS setups, a
+  `MultisessionFuture ... non-exportable reference (externalptr)` error). Set
+  `ATLASLENS_FUTURE_PLAN=sequential` to run analyses on the main thread instead.
+  This is the most portable mode and works on every OS; the only trade-off is
+  that the interface is blocked while a long analysis runs. Accepted values are
+  `sequential`, `multisession`, and `multicore`.
 - **Ensembl-to-symbol conversion stalls.** biomaRt queries Ensembl over the
-  network. Confirm the host has outbound HTTPS access; on a restricted
-  server, pre-convert IDs offline and reload the object.
+  network. The app uses the offline OrgDb databases first and only falls back to
+  biomaRt; if it still stalls, confirm the host has outbound HTTPS access, or
+  pre-convert IDs offline and reload the object.
+- **`invalid class "Assay5" object: All layers must have a record in the cells
+  map`.** The object is a Seurat v5 object written under a different Seurat
+  version. Re-save it with a **classic v3 assay** — `anndata_to_seurat.R` does
+  this automatically, or in R run
+  `obj[["RNA"]] <- as(obj[["RNA"]], "Assay")` and `saveRDS()` again.
+- **Time Series tab shows no timepoints, or picks the wrong column.** Declare
+  the timepoint column explicitly via `timeseries_column` in
+  `landing_config.json` (see [Time Series column mapping](#time-series-column-mapping-optional)).
+
 
 ## Citation
 

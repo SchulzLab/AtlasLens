@@ -72,8 +72,12 @@ RUN R -e "for (pv in list(c('globals','0.18.0'), c('parallelly','1.45.1'), c('li
 # Create app directory
 RUN mkdir -p /srv/shiny-server/app
 
-# Copy the app source code
+# Copy the app source code and its landing-page / species / Time Series column
+# configuration. landing_config.json is optional at runtime, but baking it in
+# lets the deployer ship intro text, an explicit species, and Time Series column
+# overrides without a separate mount.
 COPY app.R /srv/shiny-server/app/app.R
+COPY landing_config.json /srv/shiny-server/app/landing_config.json
 
 # Ensure the cache directory structure exists and is writable by the 'shiny' user
 # The app uses ~/tmp by default, but having this ensures permissions are correct if
