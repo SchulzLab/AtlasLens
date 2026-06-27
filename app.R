@@ -1845,41 +1845,64 @@ if (!is.null(DEFAULT_DATA_PATH) && file.exists(DEFAULT_DATA_PATH)) {
     # takes a while to open (watch the Pre-load: log) - it is working, not frozen.
     # ATLASLENS_AUTOPROCESS=0 skips the no-UMAP computation entirely.
     reds_present <- names(seurat_obj@reductions)
-    # Match the reduction named EXACTLY "umap" (case-insensitive) - NOT
-    # integration-specific variants like "umap_harmony"/"umap_harmony_EC", which
-    # are not the standard UMAP the scatter expects. If only those exist, fall
-    # through and build a fresh "umap" (the pre-existing behaviour).
-    has_umap     <- any(tolower(reds_present) == "umap")
     autoproc_off <- tolower(trimws(Sys.getenv("ATLASLENS_AUTOPROCESS", ""))) %in%
                     c("0", "false", "no", "off")
+    # Find a reduction by name, case-insensitively (so "Harmony"/"harmony",
+    # "scVI"/"scvi", "PCA"/"pca" all match). The "umap" check is EXACT - the
+    # integration variants "umap_harmony"/"umap_harmony_EC" must NOT count as the
+    # standard UMAP.
+    find_red <- function(name) {
+      hit <- reds_present[tolower(reds_present) == tolower(name)]
+      if (length(hit)) hit[[1]] else NULL
+    }
+    umap_red <- find_red("umap")
 
-    if (has_umap) {
+    if (!is.null(umap_red)) {
+      # 1) A real UMAP already exists -> use it, no compute.
       message("Pre-load: using existing 'umap' reduction - no reprocessing.")
     } else if (autoproc_off) {
-      message("Pre-load: no UMAP reduction found, and ATLASLENS_AUTOPROCESS is disabled - ",
+      message("Pre-load: no 'umap' reduction found, and ATLASLENS_AUTOPROCESS is disabled - ",
               "skipping. The map view will be unavailable; all analysis tabs still work.")
     } else {
-      # No standard "umap" reduction -> compute one EXACTLY as earlier versions
-      # did: Normalize -> FindVariableFeatures -> Scale -> PCA -> RunUMAP(dims 1:20)
-      # on the fresh PCA. (Running UMAP straight off an existing harmony space
-      # gave a different, less-separated layout; this reproduces the old look.)
-      # It runs synchronously, so on a large object the app takes a few minutes
-      # to open - it is working, not frozen. Set ATLASLENS_AUTOPROCESS=0 to skip.
-      message("Pre-load: no 'umap' reduction - computing one ",
-              "(NormalizeData -> FindVariableFeatures -> ScaleData -> RunPCA -> RunUMAP). ",
-              "One-time; can take a few minutes on a large object - it is working, not frozen.")
-      message("Pre-load:   NormalizeData ...");        seurat_obj <- NormalizeData(seurat_obj, verbose = FALSE)
-      message("Pre-load:   FindVariableFeatures ...");  seurat_obj <- FindVariableFeatures(seurat_obj, verbose = FALSE)
-      message("Pre-load:   ScaleData ...");             seurat_obj <- ScaleData(seurat_obj, verbose = FALSE)
-      message("Pre-load:   RunPCA ...");                seurat_obj <- RunPCA(seurat_obj, verbose = FALSE)
-      message("Pre-load:   RunUMAP ...")
-      seurat_obj <- tryCatch(
-        suppressWarnings(RunUMAP(seurat_obj, dims = 1:20, verbose = FALSE)),
-        error = function(e) {
-          message("Pre-load:   RunUMAP failed (", conditionMessage(e), "); the scatter will use PCA.")
-          seurat_obj
-        })
-      message("Pre-load: processing complete.")
+      # 2) No UMAP: build one by running UMAP DIRECTLY on an existing low-D space,
+      #    in priority order (integration tools first, then PCA). 3) If none of
+      #    those exist, compute everything from scratch. dims = 1:30 (capped at the
+      #    reduction's available dimensions).
+      base_red <- NULL
+      for (nm in c("scVI", "harmony", "integrated.cca", "integrated.rpca", "pca")) {
+        base_red <- find_red(nm)
+        if (!is.null(base_red)) break
+      }
+      if (!is.null(base_red)) {
+        nd <- min(30L, ncol(Embeddings(seurat_obj, base_red)))
+        message("Pre-load: no 'umap' reduction; computing UMAP from the existing '",
+                base_red, "' reduction (dims 1:", nd, ") ...")
+        seurat_obj <- tryCatch(
+          suppressWarnings(RunUMAP(seurat_obj, reduction = base_red, dims = 1:nd, verbose = FALSE)),
+          error = function(e) {
+            message("Pre-load: RunUMAP on '", base_red, "' failed (", conditionMessage(e),
+                    "); the scatter will fall back to that reduction.")
+            seurat_obj
+          })
+        message("Pre-load: UMAP computation complete.")
+      } else {
+        message("Pre-load: no dimensional reduction found - computing from scratch ",
+                "(NormalizeData -> FindVariableFeatures -> ScaleData -> RunPCA -> RunUMAP). ",
+                "One-time; can take a few minutes on a large object - it is working, not frozen.")
+        message("Pre-load:   NormalizeData ...");        seurat_obj <- NormalizeData(seurat_obj, verbose = FALSE)
+        message("Pre-load:   FindVariableFeatures ...");  seurat_obj <- FindVariableFeatures(seurat_obj, verbose = FALSE)
+        message("Pre-load:   ScaleData ...");             seurat_obj <- ScaleData(seurat_obj, verbose = FALSE)
+        message("Pre-load:   RunPCA ...");                seurat_obj <- RunPCA(seurat_obj, verbose = FALSE)
+        nd <- min(30L, ncol(Embeddings(seurat_obj, "pca")))
+        message("Pre-load:   RunUMAP (dims 1:", nd, ") ...")
+        seurat_obj <- tryCatch(
+          suppressWarnings(RunUMAP(seurat_obj, dims = 1:nd, verbose = FALSE)),
+          error = function(e) {
+            message("Pre-load:   RunUMAP failed (", conditionMessage(e), "); the scatter will use PCA.")
+            seurat_obj
+          })
+        message("Pre-load: processing complete.")
+      }
     }
     seurat_obj <- ensure_qc_columns(seurat_obj)
     dataset_hash <- digest(paste(ncol(seurat_obj), nrow(seurat_obj), colnames(seurat_obj@meta.data), collapse = "_"), algo = "md5")
