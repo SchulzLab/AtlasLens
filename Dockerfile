@@ -69,6 +69,16 @@ RUN R -e "remotes::install_github('immunogenomics/presto')"
 # their build cache; dependencies precede the packages that need them.
 RUN R -e "for (pv in list(c('globals','0.18.0'), c('parallelly','1.45.1'), c('listenv','0.9.1'), c('later','1.4.4'), c('future','1.67.0'), c('future.apply','1.20.0'), c('promises','1.3.3'))) remotes::install_version(pv[1], pv[2], repos='https://cloud.r-project.org', upgrade='never')"
 
+# Pin Shiny + ggplot2 to the mutually-compatible pair used in environment.yml.
+# The base image / dependency resolution otherwise leaves a too-old Shiny next to
+# a modern ggplot2. When that happens Shiny cannot read ggplot2's panel ranges,
+# so the click-and-drag brush on the UMAPs returns NORMALISED [0,1] coordinates
+# instead of data coordinates - zoom-to-brush then selects the wrong region
+# (see rstudio/shiny#1420). Done AFTER the heavy installs so it overrides the
+# stale copies without invalidating their build cache.
+RUN R -e "for (pv in list(c('ggplot2','3.5.2'), c('shiny','1.11.1'))) remotes::install_version(pv[1], pv[2], repos='https://cloud.r-project.org', upgrade='never')"
+RUN R -e "stopifnot(packageVersion('shiny') == '1.11.1', packageVersion('ggplot2') == '3.5.2'); cat('Shiny/ggplot2 pinned OK\n')"
+
 # Create app directory
 RUN mkdir -p /srv/shiny-server/app
 
