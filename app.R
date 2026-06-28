@@ -559,6 +559,17 @@ load_and_process_seurat_worker <- function(file_path, cache_dir) {
 
 run_cocoa_worker <- function(counts_matrix, gene, gene_sets, samplesize, n_sims,
                              log_transform = FALSE) {
+  # geneCOCOA uses gene names as R variables inside its regression formulas, so a
+  # symbol that is not a syntactically valid R name breaks it with an
+  # "unexpected symbol" parse error. The common offenders are mouse RIKEN genes
+  # like "0610007N19Rik", which start with a digit. make.names() makes every name
+  # valid (e.g. -> "X0610007N19Rik"); applied consistently to the matrix, the GOI
+  # and the gene sets so they still match one another. Output is keyed on gene-SET
+  # names, so this internal renaming never shows up in the results.
+  rownames(counts_matrix) <- make.names(rownames(counts_matrix))
+  gene      <- make.names(gene)
+  gene_sets <- lapply(gene_sets, make.names)
+
   # Calculate true library sizes BEFORE subsetting genes to prevent 0-sum NaN errors
   lib_sizes <- colSums(counts_matrix)
   lib_sizes[lib_sizes == 0] <- 1 # Fallback for completely empty cells
@@ -1390,6 +1401,12 @@ r_literal <- function(x) {
     "dataset_path <- Sys.getenv('DATASET_PATH')",
     "if (!nzchar(dataset_path)) stop('Set DATASET_PATH before running.')",
     "seurat_obj <- readRDS(dataset_path)",
+    "# Migrate objects saved under an older SeuratObject (adds newer slots such",
+    "# as assay.orig) so subsetting / GetAssayData do not fail with a validObject",
+    "# error. Keep the original object if migration itself errors.",
+    "seurat_obj <- tryCatch(",
+    "  suppressWarnings(suppressMessages(SeuratObject::UpdateSeuratObject(seurat_obj))),",
+    "  error = function(e) seurat_obj)",
     "if (!'RNA' %in% names(seurat_obj@assays)) {",
     "  default_assay <- DefaultAssay(seurat_obj)",
     "  seurat_obj[['RNA']] <- seurat_obj[[default_assay]]",
@@ -1501,12 +1518,22 @@ generate_cocoa_script <- function(gene, comparison_meta, filter_list,
     "hallmark <- msigdbr::msigdbr(species = species, category = 'H')",
     "gene_sets <- split(hallmark$gene_symbol, hallmark$gs_name)",
     "",
+    "# geneCOCOA uses gene names as R variables in its regression formulas, so a",
+    "# symbol that is not a valid R name (e.g. mouse RIKEN genes like",
+    "# '0610007N19Rik', which start with a digit) triggers an 'unexpected symbol'",
+    "# error. make.names() makes them valid; applied to the gene, the gene sets,",
+    "# and (below) the counts matrix rownames so they still match each other.",
+    "# Results are keyed on gene-set names, so this renaming is invisible.",
+    "gene_of_interest <- make.names(gene_of_interest)",
+    "gene_sets <- lapply(gene_sets, make.names)",
+    "",
     "# Run COCOA once per group, on a counts matrix subset to the cells in",
     "# that group. Returns one results frame per group; merge for plotting.",
     "results <- lapply(names(groups), function(g) {",
     "  cells_in_group <- seurat_obj@meta.data[[meta_col]] %in% groups[[g]]",
     "  counts_mat <- Seurat::GetAssayData(seurat_obj[, cells_in_group],",
     "                                      assay = 'RNA', layer = 'counts')",
+    "  rownames(counts_mat) <- make.names(rownames(counts_mat))",
     "  geneCOCOA::COCOA(counts_matrix = counts_mat, gene = gene_of_interest,",
     "                   gene_sets = gene_sets, samplesize = samplesize,",
     "                   n_sims = n_sims)",
@@ -4836,7 +4863,7 @@ server <- function(input, output, session) {
     # Estimate time roughly: ~0.1s per cell in parallel + overhead
     total_est_cells <- 0
     for(g in groups) {
-      n_c <- sum(obj@meta.data[[meta_col]] == g & global_mask)
+      n_c <- sum(obj@meta.data[[meta_col]] %in% g & global_mask)
       total_est_cells <- total_est_cells + min(n_c, COCOA_MAX_CELLS)
     }
     
@@ -4853,7 +4880,10 @@ server <- function(input, output, session) {
     for(g in groups) {
       # Filter metadata for this group AND global mask
       # We use rownames(meta_df) assuming they match colnames(obj) which is standard in Seurat
-      in_group_mask <- meta_df[[meta_col]] == g & global_mask
+      # %in% (not ==) so an NA in the grouping column yields FALSE, never NA - an
+      # NA index would otherwise inject NA cell names and crash the worker with
+      # "subscript out of bounds" when subsetting the counts matrix.
+      in_group_mask <- meta_df[[meta_col]] %in% g & global_mask
       cells_in_group <- rownames(meta_df)[in_group_mask]
       
       # Downsample if needed
@@ -4948,7 +4978,7 @@ server <- function(input, output, session) {
       
       res_list <- list(); error_log <- c()
       for (g in groups) {
-        cells_in_group <- rownames(meta_data_subset)[meta_data_subset[[meta_col]] == g]
+        cells_in_group <- rownames(meta_data_subset)[meta_data_subset[[meta_col]] %in% g]
         
         if (length(cells_in_group) >= 20) {
           grp_counts <- counts_matrix[, cells_in_group]
@@ -5134,7 +5164,7 @@ server <- function(input, output, session) {
   observeEvent(input$dea_add_filter, { col <- input$dea_filter_col_select; val <- input$dea_filter_vals_select; if(is.null(col) || is.null(val)) return(); curr <- vals$dea_filter_list; exist <- which(vapply(curr, function(x) x$col == col, logical(1))); if(length(exist)>0) curr[[exist]]$vals <- val else curr[[length(curr)+1]] <- list(col=col, vals=val); vals$dea_filter_list <- curr })
   observeEvent(input$dea_remove_filter, { idx <- as.numeric(input$dea_remove_filter); if(length(vals$dea_filter_list)>=idx) vals$dea_filter_list[[idx]] <- NULL })
   output$dea_active_filters_ui <- renderUI({ if(length(vals$dea_filter_list)==0) return(NULL); div(class = "active-filters", lapply(seq_along(vals$dea_filter_list), function(i) { f <- vals$dea_filter_list[[i]]; span(span(class="filter-badge", strong(f$col), ": ", paste(head(f$vals, 2), collapse=","), if(length(f$vals)>2)"..."), tags$a("✕", href = "#", onclick = paste0("Shiny.setInputValue('dea_remove_filter', ", i, ", {priority: 'event'}); return false;"), style="color: red; margin-left: 5px; text-decoration: none; cursor: pointer;")) })) })
-  output$dea_cell_count_ui <- renderUI({ req(vals$data, input$dea_meta_col, input$dea_group1, input$dea_group2); obj <- vals$data; mask1 <- obj@meta.data[[input$dea_meta_col]] == input$dea_group1; mask2 <- obj@meta.data[[input$dea_meta_col]] == input$dea_group2; for(f in vals$dea_filter_list) { mask1 <- mask1 & (obj@meta.data[[f$col]] %in% f$vals); mask2 <- mask2 & (obj@meta.data[[f$col]] %in% f$vals) }; div(class = "cell-count-box", p(icon("users"), " Group 1: ", format(sum(mask1), big.mark = ",")), p(icon("users"), " Group 2: ", format(sum(mask2), big.mark = ",")), p(strong("Total: "), format(sum(mask1)+sum(mask2), big.mark = ","))) })
+  output$dea_cell_count_ui <- renderUI({ req(vals$data, input$dea_meta_col, input$dea_group1, input$dea_group2); obj <- vals$data; mask1 <- obj@meta.data[[input$dea_meta_col]] %in% input$dea_group1; mask2 <- obj@meta.data[[input$dea_meta_col]] %in% input$dea_group2; for(f in vals$dea_filter_list) { mask1 <- mask1 & (obj@meta.data[[f$col]] %in% f$vals); mask2 <- mask2 & (obj@meta.data[[f$col]] %in% f$vals) }; div(class = "cell-count-box", p(icon("users"), " Group 1: ", format(sum(mask1), big.mark = ",")), p(icon("users"), " Group 2: ", format(sum(mask2), big.mark = ",")), p(strong("Total: "), format(sum(mask1)+sum(mask2), big.mark = ","))) })
   output$dea_run_btn_ui <- renderUI({ 
     if (is.null(input$dea_group1) || is.null(input$dea_group2) || input$dea_group1 == input$dea_group2) {
       actionButton("dea_run_disabled", "Complete Fields First", class = "btn-secondary btn-block btn-lg disabled", icon = icon("hand-pointer"))
