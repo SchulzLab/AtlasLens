@@ -130,15 +130,19 @@ RUN R -e "remotes::install_github('immunogenomics/presto')"
 # their build cache; dependencies precede the packages that need them.
 RUN R -e "for (pv in list(c('globals','0.18.0'), c('parallelly','1.45.1'), c('listenv','0.9.1'), c('later','1.4.4'), c('future','1.67.0'), c('future.apply','1.20.0'), c('promises','1.3.3'))) remotes::install_version(pv[1], pv[2], repos='https://cloud.r-project.org', upgrade='never')"
 
-# Pin Shiny to the version mutually-compatible with ggplot2 3.5.2 (installed
-# above, before the GO stack). The base image / dependency resolution otherwise
-# leaves a too-old Shiny next to a modern ggplot2. When that happens Shiny cannot
-# read ggplot2's panel ranges, so the click-and-drag brush on the UMAPs returns
-# NORMALISED [0,1] coordinates instead of data coordinates - zoom-to-brush then
-# selects the wrong region (see rstudio/shiny#1420). The assertion re-confirms
-# BOTH versions made it into the final image.
-RUN R -e "remotes::install_version('shiny', '1.11.1', repos='https://cloud.r-project.org', upgrade='never')"
-RUN R -e "stopifnot(packageVersion('shiny') == '1.11.1', packageVersion('ggplot2') == '3.5.2'); cat('Shiny/ggplot2 pinned OK\n')"
+# Pin Shiny + patchwork to the versions mutually-compatible with ggplot2 3.5.2
+# (installed above, before the GO stack); these match the validated conda
+# environment.yml (shiny 1.11.1, patchwork 1.3.2). The base image's frozen
+# 2023-10-30 snapshot otherwise leaves them too old next to the modern ggplot2:
+#  - too-old Shiny can't read ggplot2's panel ranges, so the click-and-drag brush
+#    on the UMAPs returns NORMALISED [0,1] coords and zoom-to-brush selects the
+#    wrong region (rstudio/shiny#1420);
+#  - patchwork 1.1.3 predates ggplot2 3.5 support, so combining plots (the GO
+#    Enrichment scatter, which uses patchwork::plot_layout) dies in add_guides
+#    with "'==' only defined for equally-sized data frames".
+# The assertion re-confirms all three versions made it into the final image.
+RUN R -e "for (pv in list(c('shiny','1.11.1'), c('patchwork','1.3.2'))) remotes::install_version(pv[1], pv[2], repos='https://cloud.r-project.org', upgrade='never')"
+RUN R -e "stopifnot(packageVersion('shiny') == '1.11.1', packageVersion('ggplot2') == '3.5.2', packageVersion('patchwork') == '1.3.2'); cat('Shiny/ggplot2/patchwork pinned OK\n')"
 
 # Create app directory
 RUN mkdir -p /srv/shiny-server/app

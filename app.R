@@ -73,10 +73,7 @@ if (!dir.exists(CACHE_DIR)) {
   message(paste("Config: Ephemeral cache directory exists at", CACHE_DIR))
 }
 
-SAMPLESIZE <- 10
-PSEUDOCOUNT <- 0.1
-N_SIMULATIONS <- 100
-MAX_UPLOAD_SIZE <- 20000 
+MAX_UPLOAD_SIZE <- 20000
 COCOA_MAX_CELLS <- 500 # Limit cells per group for COCOA speed (Downsampling threshold)
 # Any atomic metadata column with more distinct values than this is treated as a
 # per-cell identifier (e.g. a barcode column) rather than a grouping factor. Such
@@ -133,26 +130,6 @@ if (ts_plan == "sequential") {
           "Set ATLASLENS_FUTURE_PLAN=sequential if background workers crash.")
 }
 
-# === LOGGING & LOCKING ===
-# Disabled: this file-based lock helper set is currently unused (defined but
-# never called anywhere in the app). Kept commented out in case cross-process
-# cache locking is reintroduced later.
-# get_lock_file <- function(filename) {
-#   file.path(CACHE_DIR, paste0("lock_", filename, ".txt"))
-# }
-#
-# is_locked <- function(filename) {
-#   file.exists(get_lock_file(filename))
-# }
-#
-# set_lock <- function(filename) {
-#   file.create(get_lock_file(filename))
-# }
-#
-# remove_lock <- function(filename) {
-#   f <- get_lock_file(filename)
-#   if (file.exists(f)) unlink(f)
-# }
 
 # === HELPER FUNCTIONS ===
 
@@ -461,96 +438,6 @@ get_expanded_palette <- function(n) {
   }
 }
 
-# === WORKER: LOAD & PROCESS ===
-load_and_process_seurat_worker <- function(file_path, cache_dir) {
-  filename <- basename(file_path)
-  tryCatch({
-    cached_path <- file.path(cache_dir, paste0("processed_", filename, ".qs"))
-    
-    if (file.exists(cached_path)) {
-      tryCatch({
-        seurat_obj <- qs::qread(cached_path) 
-        
-        # Check for either umap or scVI
-        if ("umap" %in% names(seurat_obj@reductions) || "scVI" %in% names(seurat_obj@reductions)) {
-          # Hash the object's shape (cells x genes x metadata columns) - the SAME
-          # formula as the fresh-load branch below - so a given dataset gets one
-          # stable hash regardless of whether it came from cache or was processed
-          # fresh. (Previously this hashed the cache path, yielding a different
-          # hash than the fresh path and desyncing the on-disk analysis caches.)
-          dataset_hash <- digest(paste(ncol(seurat_obj), nrow(seurat_obj), colnames(seurat_obj@meta.data), collapse = "_"), algo = "md5")
-          return(list(data = seurat_obj, error = NULL, hash = dataset_hash, msg = "Loaded cached processed data."))
-        }
-      }, error = function(e) unlink(cached_path))
-    }
-    
-    if (!file.exists(file_path)) return(list(data = NULL, error = paste("File not found:", file_path), hash = NULL))
-    
-    if (grepl("\\.qs$", file_path)) { seurat_obj <- qs::qread(file_path) } else { seurat_obj <- readRDS(file_path) }
-    # Migrate objects saved under an older SeuratObject so newer Assay slots
-    # (e.g. "assay.orig") exist; otherwise validObject() fails on the first
-    # subset/GetAssayData. Keep the original if migration errors.
-    seurat_obj <- tryCatch(
-      suppressWarnings(suppressMessages(UpdateSeuratObject(seurat_obj))),
-      error = function(e) seurat_obj)
-    gc()
-    
-    if (ncol(seurat_obj@meta.data) > 0) {
-      seurat_obj@meta.data[] <- lapply(seurat_obj@meta.data, function(x) {
-        if (is.factor(x)) levels(x) <- iconv(levels(x), "UTF-8", "UTF-8", sub = "_")
-        if (is.character(x)) x <- iconv(x, "UTF-8", "UTF-8", sub = "_")
-        return(x)
-      })
-    }
-    
-    
-    if (!"RNA" %in% names(seurat_obj@assays)) {
-      default_assay <- DefaultAssay(seurat_obj)
-      seurat_obj[["RNA"]] <- seurat_obj[[default_assay]]
-    }
-    DefaultAssay(seurat_obj) <- "RNA"
-    if (inherits(seurat_obj[["RNA"]], "Assay5")) suppressWarnings({ seurat_obj[["RNA"]] <- JoinLayers(seurat_obj[["RNA"]]) })
-    
-    # Log-normalise whenever RNA@data still holds raw counts, INDEPENDENT of
-    # whether a UMAP/PCA already exists. (Previously NormalizeData ran only when
-    # there was no umap/scVI, so an object that shipped with a UMAP but raw
-    # counts in @data was never normalised.)
-    rna_dat <- tryCatch(GetAssayData(seurat_obj, assay = "RNA", layer = "data"),
-                        error = function(e) NULL)
-    if (data_layer_is_raw_counts(rna_dat)) {
-      seurat_obj <- NormalizeData(seurat_obj, verbose = FALSE); gc()
-    }
-
-    was_processed <- FALSE
-    # Compute a UMAP only if the object doesn't already have one (this is a
-    # separate concern from normalisation, above).
-    if (!("umap" %in% names(seurat_obj@reductions)) && !("scVI" %in% names(seurat_obj@reductions))) {
-      seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000, verbose = FALSE); gc()
-      seurat_obj <- ScaleData(seurat_obj, features = VariableFeatures(seurat_obj), verbose = FALSE); gc()
-      seurat_obj <- RunPCA(seurat_obj, features = VariableFeatures(seurat_obj), verbose = FALSE); gc()
-      suppressWarnings({ seurat_obj <- RunUMAP(seurat_obj, dims = 1:20, verbose = FALSE, n.neighbors = 15, min.dist = 0.5) })
-      gc()
-      was_processed <- TRUE
-    }
-    
-    msg <- "Loaded successfully."
-    if (was_processed || !file.exists(cached_path)) {
-      qs::qsave(seurat_obj, cached_path)
-      msg <- "Data processed and cached! Next load will be instant."
-    }
-    
-    # Make sure the QC metadata columns (nFeature_RNA / nCount_RNA / percent.mt)
-    # are available so the QC Violins subtab can render even on objects that
-    # were saved without them.
-    seurat_obj <- ensure_qc_columns(seurat_obj)
-    
-    dataset_hash <- digest(paste(ncol(seurat_obj), nrow(seurat_obj), colnames(seurat_obj@meta.data), collapse = "_"), algo = "md5")
-    return(list(data = seurat_obj, error = NULL, hash = dataset_hash, msg = msg))
-  }, error = function(e) {
-    return(list(data = NULL, error = conditionMessage(e), hash = NULL))
-  })
-}
-
 # --- WORKER FUNCTIONS ---
 
 # =============================================================================
@@ -630,7 +517,6 @@ run_dea_worker <- function(subset_counts, subset_meta, meta_col, group1, group2)
                                      test.use = "wilcox", use_presto = TRUE,
                                      logfc.threshold = 0, min.pct = 0.1, verbose = FALSE,
                                      assay = "RNA", slot = "data", recorrect_umi = FALSE)
-      # dea_universe <- rownames(seurat_obj)
     })
   })
   gc()
@@ -653,8 +539,6 @@ run_dea_worker <- function(subset_counts, subset_meta, meta_col, group1, group2)
 # org_db / ontology are passed through to rrvgo because the reduction step
 # needs them to look up GO term annotations.
 
-# run_go_worker <- function(gene_list, species, ontology, p_cutoff, q_cutoff,
-#                           mode, key_type) {
 run_go_worker <- function(gene_list, species, ontology, p_cutoff, q_cutoff,
                           mode, key_type, universe = NULL) {
   org_db <- switch(species,
@@ -998,9 +882,6 @@ scale_color_expression <- function(name = "Expression", limits = NULL)
 scale_color_zscore <- function(name = "z-score", limits = NULL)
   scale_color_gradient2(low = "#3b4cc0", mid = "#f7f7f7", high = "#b40426",
                         midpoint = 0, name = name, limits = limits)
-# Sequential scale for p-values: bright = small p = more significant.
-scale_color_pvalue <- function(name = "p.adjust")
-  scale_color_viridis_c(option = "viridis", direction = -1, name = name)
 
 # Lightweight "nothing rendered yet" panel. UMAP/coexpression plots can take a
 # few seconds on a 100k-cell object, so we no longer draw them on startup -
@@ -1354,7 +1235,6 @@ create_multi_gene_dotplot <- function(seurat_obj, genes, group_col,
 
 create_cache_key <- function(dataset_hash, filter_list, comparison_meta) {
   filter_str <- if(length(filter_list) > 0) { paste(sapply(filter_list, function(f) paste0(f$col, ":", paste(sort(f$vals), collapse = ","))), collapse = "|") } else { "NOFILTER" }
-  #comp_str <- paste0(comparison_meta$col, ":", paste(sort(comparison_meta$groups), collapse = ","))
   #preserve order in the cache key                                                         
   comp_str <- paste0(
     comparison_meta$col, ":",
@@ -2515,10 +2395,6 @@ ui <- navbarPage(
                               div(class = "section-header", icon("sitemap"), " 4. GO Ontology"),
                               selectInput("go_ontology", "Ontology:", choices = c("Biological Process" = "BP", "Molecular Function" = "MF", "Cellular Component" = "CC"), selected = "BP"),
                               helpText("Gene-ID type is detected automatically. Species comes from the landing_config.json \"species\" field when set (enter 1 = human, 2 = mouse, 3 = zebrafish); otherwise it is auto-detected from your genes."),
-                              # hr()),
-                              # # --- Run button ---
-                              # br(),
-                              # uiOutput("go_run_btn_ui")
                               
                               hr(),
                               # --- Display options ---
@@ -2800,7 +2676,6 @@ server <- function(input, output, session) {
     }
   })
   
-  #observe({ 
   observeEvent(vals$data, { 
     req(vals$data); 
     
@@ -3006,7 +2881,6 @@ server <- function(input, output, session) {
   
   render_gene_info <- function(gene, data) {
     if (gene == "" || is.null(gene) || !(gene %in% rownames(data))) return(NULL)
-   # expr <- GetAssayData(data, layer = "data")[gene, ]
     expr <- get_expr_row(gene)    # uses session cache instead of re-extracting 
     n_cells <- sum(expr > 0)
     div(class = "gene-info-box", p(icon("check-circle", style = "color: green;"), strong("Selected")), p(style = "margin: 3px 0;", paste0("• Expressing Cells: ", format(n_cells, big.mark=",")))) 
@@ -3466,27 +3340,10 @@ server <- function(input, output, session) {
       req(length(vals$ts_active_gene) >= 2)
     }
     
-    meta <- vals$data@meta.data
-    
     # Auto-detect the dataset's control condition so it is always rendered
     # alongside the user-selected condition. The control reference is
     # required for time-course interpretation of treatment-induced
     # trajectories.
-    # ds_mask <- ts_dataset_filter()
-    # ds_conditions <- unique(as.character(meta[[r$condition]][ds_mask]))
-    # ctrl <- detect_control_conditions(ds_conditions)
-    # conditions_to_use <- vals$ts_active_condition
-    # if (length(ctrl) > 0 && !ctrl[1] %in% conditions_to_use) {
-    #   conditions_to_use <- c(ctrl[1], conditions_to_use)
-    # }
-    # 
-    # mask <- ds_mask &
-    #   meta[[r$condition]] %in% conditions_to_use &
-    #   meta[[r$celltype]]  == vals$ts_active_celltype &
-    #   meta[[r$timepoint]] %in% vals$ts_active_tps
-    # if (sum(mask) == 0) return(NULL)
-    # 
-    # sub_obj <- vals$data[, mask]
     
     slice <- ts_data_slice(); req(slice)
     sub_obj <- slice$sub_obj
@@ -3822,18 +3679,6 @@ server <- function(input, output, session) {
     
     # Always include the auto-detected control condition alongside the
     # user-selected condition so the treatment trajectory has a reference.
-    meta <- vals$data@meta.data
-    # ds_mask <- ts_dataset_filter()
-    # ds_conds <- unique(as.character(meta[[r$condition]][ds_mask]))
-    # ctrl <- detect_control_conditions(ds_conds)
-    # conditions_use <- unique(c(vals$ts_active_condition, ctrl))
-    # mask <- ds_mask &
-    #   meta[[r$condition]] %in% conditions_use &
-    #   meta[[r$celltype]]  == vals$ts_active_celltype &
-    #   meta[[r$timepoint]] %in% vals$ts_active_tps
-    # if (sum(mask) == 0) return(NULL)
-    # 
-    # sub_obj <- vals$data[, mask]
     slice <- ts_data_slice(); req(slice)
     sub_obj        <- slice$sub_obj
     conditions_to_use <- slice$conditions_use
@@ -3887,18 +3732,6 @@ server <- function(input, output, session) {
     r <- vals$ts_active_roles %||% ts_roles()
     req(!is.null(r$timepoint), !is.null(r$celltype))
     
-    meta <- vals$data@meta.data
-    ds_mask <- ts_dataset_filter()
-    # ds_conds <- unique(as.character(meta[[r$condition]][ds_mask]))
-    # ctrl <- detect_control_conditions(ds_conds)
-    # conditions_use <- unique(c(vals$ts_active_condition, ctrl))
-    # mask <- ds_mask &
-    #   meta[[r$condition]] %in% conditions_use &
-    #   meta[[r$celltype]]  == vals$ts_active_celltype &
-    #   meta[[r$timepoint]] %in% vals$ts_active_tps
-    # if (sum(mask) == 0) return(NULL)
-    # 
-    # sub_obj <- vals$data[, mask]
     slice <- ts_data_slice(); req(slice)
     sub_obj <- slice$sub_obj
     conditions_to_use <- slice$conditions_use
@@ -3980,18 +3813,6 @@ server <- function(input, output, session) {
     r <- vals$ts_active_roles %||% ts_roles()
     req(!is.null(r$timepoint), !is.null(r$celltype))
 
-    meta <- vals$data@meta.data
-    # ds_mask <- ts_dataset_filter()
-    # ds_conds <- unique(as.character(meta[[r$condition]][ds_mask]))
-    # ctrl <- detect_control_conditions(ds_conds)
-    # conditions_use <- unique(c(vals$ts_active_condition, ctrl))
-    # mask <- ds_mask &
-    #   meta[[r$condition]] %in% conditions_use &
-    #   meta[[r$celltype]]  == vals$ts_active_celltype &
-    #   meta[[r$timepoint]] %in% vals$ts_active_tps
-    # if (sum(mask) == 0) return(NULL)
-    # 
-    # sub_obj <- vals$data[, mask]
     slice <- ts_data_slice(); req(slice)
     sub_obj <- slice$sub_obj
     conditions_to_use <- slice$conditions_use
@@ -4967,11 +4788,6 @@ server <- function(input, output, session) {
       return()
     }
     meta_data_subset <- obj@meta.data[final_cells_to_keep, , drop = FALSE]
-    # Log-transform paper-grade mode is currently disabled in the UI; the
-    # worker is therefore always called with the fast configuration.
-    #log_transform_flag <- FALSE
-    log_transform_flag <- TRUE #log2 transform CPM
-    n_sims_cfg <- 100L
     # Species inference for msigdbr gene-set lookup (landing_config "species"
     # wins; otherwise auto-detected).
     species_cfg <- detect_species(vals$data, vals$landing_config$species)
@@ -5735,10 +5551,6 @@ server <- function(input, output, session) {
   })
   
   # Dot plot
-  # output$go_dotplot <- renderPlot({
-  #   dl <- go_df_list(); req(length(dl) > 0)
-  #   create_go_dotplot(dl)
-  # }, height = 650)
   
   output$go_dotplot <- renderPlot({
     dl <- go_df_list(); req(length(dl) > 0)
