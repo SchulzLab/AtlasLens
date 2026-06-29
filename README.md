@@ -210,9 +210,8 @@ your data first, then point `DATASET_PATH` at the resulting `.rds`:
   the expression matrix, and carries over `obsm` embeddings (`X_umap`, `X_pca`).
   It prints the resulting assay class — confirm it says `Assay` (v3).
 
-- **Raw / matrix files (10x, CSV, …)** — a companion script that builds a Seurat
-  object from raw input files is available at
-  **[<add GitHub link here>](#)**. Convert with it, then load the `.rds` in
+- **Raw / matrix files (10x, CSV, …)** — Use "build_seurat_from_files.R" companion script that builds a Seurat
+  object from raw input files,  then load the `.rds` in
   AtlasLens the same way.
 
 ### Time Series column mapping (optional)
