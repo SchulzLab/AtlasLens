@@ -47,11 +47,72 @@ RUN R -e "install.packages(c('msigdbr', 'shinycssloaders', 'viridis', 'ggrepel',
 
 RUN R -e "BiocManager::install('gemma.R')"
 
+# Redefine R's "C++11" compiler flag to gnu++17. fgsea (a dependency of
+# clusterProfiler via DOSE/enrichplot) declares SystemRequirements: C++11, so R
+# compiles it with -std=gnu++11. The BH (Boost) headers in this image now require
+# C++14+, so that compile fails with "Boost.Math requires C++14" /
+# "'is_final' has not been declared in 'std'". Because BiocManager::install()
+# does NOT return a non-zero exit code on a failed package, the build would
+# otherwise continue and ship an image silently missing clusterProfiler. Setting
+# CXX11STD here makes any C++11-requesting package compile under C++17.
+#
+# Also raise R's download timeout from its 60s default to 600s, for ALL R
+# invocations from here on (Rprofile.site is read by every `R -e` below). The
+# Bioconductor annotation packages (esp. org.Hs.eg.db) and some source tarballs
+# are large enough to exceed 60s on a normal connection; when a download times
+# out, BiocManager::install() silently skips that package and the build ships
+# without it (org.Hs.eg.db / enrichplot / clusterProfiler went missing this way).
+RUN echo 'CXX11STD = -std=gnu++17' >> /usr/local/lib/R/etc/Makevars.site \
+    && echo 'options(timeout = 600)' >> /usr/local/lib/R/etc/Rprofile.site
+
+# Install ggplot2 3.5.2 BEFORE the GO stack. ggtree 3.10.1 (a dependency of
+# enrichplot -> clusterProfiler) calls ggplot2::check_linewidth, which only
+# exists in ggplot2 >= 3.5.0; the frozen 2023-10-30 CRAN snapshot ships ggplot2
+# 3.4.4, so ggtree fails to byte-compile ("object 'check_linewidth' not found")
+# and takes enrichplot + clusterProfiler down with it. 3.5.2 is the version
+# AtlasLens is validated on (and is re-asserted with shiny lower down, where it
+# is now a no-op). update=FALSE in the GO step below preserves this version.
+RUN R -e "remotes::install_version('ggplot2', '3.5.2', repos='https://cloud.r-project.org', upgrade='never')"
+
 # GO Enrichment + biomaRt stack (Bioconductor 3.18 matches R 4.3.x).
 # clusterProfiler / rrvgo / GOSemSim / enrichplot / DOSE / AnnotationDbi : GO over-representation + semantic-similarity reduction
 # biomaRt                                                                 : Ensembl ID -> gene symbol conversion (geneCOCOA + GO tabs)
 # GO.db / org.Hs.eg.db / org.Mm.eg.db / org.Dr.eg.db                      : GO term + human / mouse / zebrafish gene annotation
-RUN R -e "BiocManager::install(c('clusterProfiler', 'rrvgo', 'GOSemSim', 'enrichplot', 'DOSE', 'AnnotationDbi', 'biomaRt', 'GO.db', 'org.Hs.eg.db', 'org.Mm.eg.db', 'org.Dr.eg.db'), version = '3.18', update = FALSE, ask = FALSE)"
+#
+# This is done as a self-healing + self-diagnosing R script rather than a bare
+# BiocManager::install() because that call returns exit code 0 even when a
+# package fails, so the build would otherwise ship an image whose GO Enrichment
+# tab dies at runtime with "there is no package called 'clusterProfiler'". The
+# script:
+#   1. installs the stack with update=FALSE (protects the pinned Seurat/Matrix);
+#   2. LOAD-tests each package and prints the REAL error (e.g. a failed shared
+#      object or a "namespace ... is required" version clash) - not just "missing";
+#   3. retries the failures with update=TRUE. enrichplot/clusterProfiler do NOT
+#      depend on Seurat, and Matrix 1.6-5 is already the newest build for R 4.3,
+#      so allowing dependency updates here cannot disturb the pinned stack. This
+#      fixes the common case where a too-old pre-installed dependency blocked
+#      enrichplot under update=FALSE;
+#   4. stops the build (non-zero exit) if anything still won't load.
+RUN R --no-save <<'EOF'
+pkgs <- c('clusterProfiler','rrvgo','GOSemSim','enrichplot','DOSE','AnnotationDbi',
+          'biomaRt','GO.db','org.Hs.eg.db','org.Mm.eg.db','org.Dr.eg.db')
+BiocManager::install(pkgs, version = '3.18', update = FALSE, ask = FALSE)
+
+# Load-test each package; print the actual error for any that fail to load.
+loads <- function(p) tryCatch({ loadNamespace(p); TRUE },
+  error = function(e) { message('LOAD FAIL [', p, ']: ', conditionMessage(e)); FALSE })
+
+bad <- pkgs[!vapply(pkgs, loads, logical(1))]
+if (length(bad)) {
+  message('Retrying with dependency updates allowed: ', paste(bad, collapse = ', '))
+  BiocManager::install(bad, version = '3.18', update = TRUE, ask = FALSE)
+  bad <- pkgs[!vapply(pkgs, loads, logical(1))]
+}
+if (length(bad))
+  stop('GO/enrichment packages still failing after retry: ', paste(bad, collapse = ', '),
+       ' (see the LOAD FAIL lines above for the underlying cause)')
+cat('GO/enrichment stack OK\n')
+EOF
 
 RUN R -e "remotes::install_github('si-ze/geneCOCOA', upgrade = 'never')"
 
@@ -69,14 +130,14 @@ RUN R -e "remotes::install_github('immunogenomics/presto')"
 # their build cache; dependencies precede the packages that need them.
 RUN R -e "for (pv in list(c('globals','0.18.0'), c('parallelly','1.45.1'), c('listenv','0.9.1'), c('later','1.4.4'), c('future','1.67.0'), c('future.apply','1.20.0'), c('promises','1.3.3'))) remotes::install_version(pv[1], pv[2], repos='https://cloud.r-project.org', upgrade='never')"
 
-# Pin Shiny + ggplot2 to the mutually-compatible pair used in environment.yml.
-# The base image / dependency resolution otherwise leaves a too-old Shiny next to
-# a modern ggplot2. When that happens Shiny cannot read ggplot2's panel ranges,
-# so the click-and-drag brush on the UMAPs returns NORMALISED [0,1] coordinates
-# instead of data coordinates - zoom-to-brush then selects the wrong region
-# (see rstudio/shiny#1420). Done AFTER the heavy installs so it overrides the
-# stale copies without invalidating their build cache.
-RUN R -e "for (pv in list(c('ggplot2','3.5.2'), c('shiny','1.11.1'))) remotes::install_version(pv[1], pv[2], repos='https://cloud.r-project.org', upgrade='never')"
+# Pin Shiny to the version mutually-compatible with ggplot2 3.5.2 (installed
+# above, before the GO stack). The base image / dependency resolution otherwise
+# leaves a too-old Shiny next to a modern ggplot2. When that happens Shiny cannot
+# read ggplot2's panel ranges, so the click-and-drag brush on the UMAPs returns
+# NORMALISED [0,1] coordinates instead of data coordinates - zoom-to-brush then
+# selects the wrong region (see rstudio/shiny#1420). The assertion re-confirms
+# BOTH versions made it into the final image.
+RUN R -e "remotes::install_version('shiny', '1.11.1', repos='https://cloud.r-project.org', upgrade='never')"
 RUN R -e "stopifnot(packageVersion('shiny') == '1.11.1', packageVersion('ggplot2') == '3.5.2'); cat('Shiny/ggplot2 pinned OK\n')"
 
 # Create app directory

@@ -2774,16 +2774,22 @@ server <- function(input, output, session) {
     cfg <- vals$landing_config
     has_intro   <- !is.null(cfg) && !is.null(cfg$introduction)   && nzchar(cfg$introduction)
     has_dataset <- !is.null(cfg) && !is.null(cfg$dataset_information) && nzchar(cfg$dataset_information)
+    # Honour newlines from landing_config.json: the JSON "\n" arrives here as a
+    # real newline character, but HTML collapses newlines to spaces, so curators
+    # would see one run-on paragraph. Escape the text (so it can't inject markup)
+    # and turn newlines into <br/> so line breaks in the config are preserved.
+    with_breaks <- function(txt)
+      HTML(gsub("\n", "<br/>", htmltools::htmlEscape(txt), fixed = TRUE))
     if (has_intro || has_dataset) {
       tagList(
         if (has_intro) div(
           h3(icon("circle-info"), " Introduction",
              style = "border-bottom: 2px solid #667eea; padding-bottom: 10px;"),
-          p(cfg$introduction)),
+          p(with_breaks(cfg$introduction))),
         if (has_dataset) div(style = "margin-top: 18px;",
                              h3(icon("database"), " Dataset Information",
                                 style = "border-bottom: 2px solid #667eea; padding-bottom: 10px;"),
-                             p(cfg$dataset_information))
+                             p(with_breaks(cfg$dataset_information)))
       )
     } else {
       # No description provided (no landing_config.json, or its fields are
