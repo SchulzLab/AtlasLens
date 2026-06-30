@@ -160,7 +160,7 @@ Rscript install.R
 ## Dataset and configuration
 
 AtlasLens expects **one integrated Seurat object** saved as an `.rds` file.
-Gene symbols (or Ensembl IDs  converted on-the-fly via biomaRt) are the row
+Gene symbols (or Ensembl IDs, converted on-the-fly using the offline Bioconductor annotation databases `org.Hs.eg.db` / `org.Mm.eg.db` / `org.Dr.eg.db`, with Ensembl biomaRt as a network fallback) are the row
 names; cell-level metadata columns are used for grouping and filtering. The
 app supports both Seurat v3 / v4 `Assay` and Seurat v5 `Assay5` objects;
 multi-layer v5 objects are joined automatically at startup.

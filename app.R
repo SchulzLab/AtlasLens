@@ -785,7 +785,7 @@ map_ensembl_to_symbol <- function(ens_ids, species) {
                     "Mus musculus" = "org.Mm.eg.db",
                     "Danio rerio"  = "org.Dr.eg.db",
                     "org.Mm.eg.db")
-  
+
   offline <- NULL
   if (requireNamespace(org_pkg, quietly = TRUE) &&
       requireNamespace("AnnotationDbi", quietly = TRUE)) {
@@ -802,14 +802,14 @@ map_ensembl_to_symbol <- function(ens_ids, species) {
   }
   # Good local coverage -> done, no network call at all.
   if (!is.null(offline) && nrow(offline) >= 0.5 * length(ens_ids)) return(offline)
-  
+
   # Otherwise try Ensembl BioMart (broader, but depends on Ensembl being up).
   online <- tryCatch(run_biomart_query(ens_ids, species), error = function(e) e)
   if (inherits(online, "data.frame") && nrow(online) > 0) return(online)
-  
+
   # BioMart unreachable too -> use whatever the local OrgDb managed, even if sparse.
   if (!is.null(offline) && nrow(offline) > 0) return(offline)
-  
+
   stop(if (inherits(online, "condition")) conditionMessage(online)
        else paste0("No Ensembl-to-symbol mappings found in the local '", org_pkg,
                    "' database, and Ensembl BioMart was unreachable."),
@@ -1963,8 +1963,11 @@ custom_header <- tags$head(
     /* === CUSTOM TOOLTIPS (NEW - REPLACES NATIVE TITLE) === */
     .custom-tooltip { position: relative; display: inline-block; cursor: help; color: #17a2b8; margin-left: 5px; transition: color 0.2s; }
     .custom-tooltip:hover { color: #2c3e50; }
-    .custom-tooltip .tooltiptext { visibility: hidden; width: 220px; background-color: #2c3e50; color: #fff; text-align: center; border-radius: 6px; padding: 8px 10px; position: absolute; z-index: 1000; bottom: 135%; left: 50%; margin-left: -110px; opacity: 0; transition: opacity 0.3s; font-size: 12px; font-weight: normal; box-shadow: 0 4px 10px rgba(0,0,0,0.2); line-height: 1.4; pointer-events: none; }
-    .custom-tooltip .tooltiptext::after { content: ''; position: absolute; top: 100%; left: 50%; margin-left: -5px; border-width: 5px; border-style: solid; border-color: #2c3e50 transparent transparent transparent; }
+    /* Tooltip sits to the RIGHT of the icon (all info-icons are in left sidebars),
+       so it never runs off the top/left of the browser window the way the old
+       centered-above tooltip did. */
+    .custom-tooltip .tooltiptext { visibility: hidden; width: 220px; background-color: #2c3e50; color: #fff; text-align: left; border-radius: 6px; padding: 8px 10px; position: absolute; z-index: 1000; top: 50%; left: calc(100% + 8px); transform: translateY(-50%); opacity: 0; transition: opacity 0.3s; font-size: 12px; font-weight: normal; box-shadow: 0 4px 10px rgba(0,0,0,0.2); line-height: 1.4; pointer-events: none; }
+    .custom-tooltip .tooltiptext::after { content: ''; position: absolute; top: 50%; right: 100%; margin-top: -5px; border-width: 5px; border-style: solid; border-color: transparent #2c3e50 transparent transparent; }
     .custom-tooltip:hover .tooltiptext { visibility: visible; opacity: 1; }
 
     /* === HISTORY & BADGES === */
@@ -2343,8 +2346,8 @@ ui <- navbarPage(
                                                       min = 300, max = 800, value = 500, step = 25),
                                           hr(),
                                           div(class = "section-header", icon("file-upload"), " 6. Restrict to a Custom Gene List (Optional)"),
-                                          tags$label("Upload a CSV or TXT file with one column of gene symbols. The volcano plot, results table, and downloads will be restricted to genes in this list. The Time Series tab's cluster export produces a compatible file."),
-                                          info_icon("Accepts a CSV with a 'gene' column or a plain text file with one gene per line. Use the Time Series tab's 'Download cluster genes' button to generate one."),
+                                          tags$label("Upload a CSV or TXT file with one column of gene symbols. The volcano plot, results table, and downloads will be restricted to genes in this list. The Time Series tab's cluster export produces a compatible file.",
+                                                     info_icon("Accepts a CSV with a 'gene' column or a plain text file with one gene per line. Use the Time Series tab's 'Download cluster genes' button to generate one.")),
                                           fileInput("dea_gene_upload", NULL,
                                                     accept = c(".csv", ".txt", ".tsv"),
                                                     buttonLabel = "Choose file...",
@@ -5636,8 +5639,24 @@ server <- function(input, output, session) {
   })
   
   output$go_full_table <- DT::renderDataTable({
-    DT::datatable(go_results_table(), options = list(pageLength = 25, scrollX = TRUE),
-                  rownames = FALSE)
+    df <- go_results_table()
+    # Show the NUMBER of genes per term, not the long '/'-separated gene list
+    # (clusterProfiler's 'geneID'), which made the table unreadable. clusterProfiler
+    # already provides that number in 'Count', so rename it and drop the gene-list
+    # column. The FULL gene list is still in the CSV download (which uses
+    # go_results_table() unchanged).
+    gcol <- grep("^geneID$", names(df), ignore.case = TRUE)
+    ccol <- grep("^Count$",  names(df), ignore.case = TRUE)
+    if (length(ccol) == 1) {
+      names(df)[ccol] <- "Number of related genes"
+      if (length(gcol) == 1) df <- df[, -gcol, drop = FALSE]
+    } else if (length(gcol) == 1) {
+      # No Count column for some reason: derive the count from the gene list.
+      df[[gcol]] <- vapply(strsplit(as.character(df[[gcol]]), "/"),
+                           function(g) sum(nzchar(g)), integer(1))
+      names(df)[gcol] <- "Number of related genes"
+    }
+    DT::datatable(df, options = list(pageLength = 25, scrollX = TRUE), rownames = FALSE)
   }, server = TRUE)
   
   # --- DOWNLOAD HANDLERS ---
