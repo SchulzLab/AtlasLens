@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <b>AtlasLens: metadata-centric exploration and analysis of single-cell atlases</b>
+  <b>AtlasLens: Metadata-centric exploration and analysis of single-cell atlases</b>
 </p>
 
 <p align="center">
