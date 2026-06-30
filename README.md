@@ -34,7 +34,7 @@ Full documentation is hosted at **[atlaslens.readthedocs.io](https://atlaslens.r
 
 AtlasLens is not yet formally published — a preprint will be available on bioRxiv
 soon. In the meantime, please reference the source code and the archived release
-(Zenodo): [doi.org/10.5281/zenodo.20666625](https://doi.org/10.5281/zenodo.20666624).
+(Zenodo): [doi.org/10.5281/zenodo.20666624](https://doi.org/10.5281/zenodo.20666624).
 See the [References](https://atlaslens.readthedocs.io/en/latest/references/) page for
 datasets and the underlying tools.
 
