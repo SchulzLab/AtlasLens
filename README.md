@@ -12,14 +12,7 @@
 
 ---
 
-**AtlasLens** is an open-source R/Shiny application for interactive, metadata-driven
-exploration of single-cell RNA-seq datasets and integrated cellular atlases. It lets
-you iteratively filter cells across any combination of metadata dimensions (tissue,
-cell type, disease status, sex, age, time point) and immediately run downstream
-analyses — interactive visualization, differential expression, Gene Ontology
-enrichment with redundancy reduction, temporal expression analysis, and
-context-dependent gene-function profiling via geneCOCOA. Every analysis can be
-revisited from a session history and exported as reproducible R code.
+**AtlasLens** is an open-source R/Shiny application for interactive, metadata-driven exploration of single-cell RNA-seq datasets and integrated cellular atlases. It lets you iteratively filter cells across any combination of metadata dimensions and immediately run downstream analyses — visualization, differential expression, GO enrichment, temporal expression, and gene-function profiling — with full history and reproducible R-code export.
 
 AtlasLens runs **locally** on your own machine, so your data stays private — see
 [Getting started](https://atlaslens.readthedocs.io/en/latest/getting-started/) to
