@@ -73,6 +73,14 @@ if (!dir.exists(CACHE_DIR)) {
   message(paste("Config: Ephemeral cache directory exists at", CACHE_DIR))
 }
 
+# Public multi-user deployment: DEA/COCOA/GO result caches are written PER SESSION
+# into CACHE_DIR/session_<token>/ (see server()) and removed when the session ends.
+# On a fresh process start, sweep any session folders - and any flat cache files
+# from the older shared-cache scheme - left behind by a previous run or an unclean
+# shutdown, so no visitor's results linger on disk.
+invisible(unlink(list.files(CACHE_DIR, pattern = "^(session_|dea_|cocoa_|go_)",
+                            full.names = TRUE), recursive = TRUE, force = TRUE))
+
 MAX_UPLOAD_SIZE <- 20000
 COCOA_MAX_CELLS <- 500 # Limit cells per group for COCOA speed (Downsampling threshold)
 # Any atomic metadata column with more distinct values than this is treated as a
@@ -1556,14 +1564,14 @@ generate_go_script <- function(go_settings, filter_list) {
   paste(body, collapse = "\n")
 }
 
-save_dea_cache <- function(dataset_hash, results, filter_list, comparison_meta, highlight_gene) {
-  cache_key <- create_cache_key(dataset_hash, filter_list, comparison_meta); cache_file <- file.path(CACHE_DIR, paste0("dea_", cache_key, ".qs"))
+save_dea_cache <- function(cache_dir, dataset_hash, results, filter_list, comparison_meta, highlight_gene) {
+  cache_key <- create_cache_key(dataset_hash, filter_list, comparison_meta); cache_file <- file.path(cache_dir, paste0("dea_", cache_key, ".qs"))
   cache_data <- list(dataset_hash = dataset_hash, results = results, filter_list = filter_list, comparison_meta = comparison_meta, timestamp = Sys.time(), gene = highlight_gene, type = "DEA")
   qs::qsave(cache_data, cache_file)
 }
 
-save_cocoa_cache <- function(dataset_hash, results, filter_list, comparison_meta, gene) {
-  cache_key <- create_cache_key(dataset_hash, filter_list, comparison_meta); cache_file <- file.path(CACHE_DIR, paste0("cocoa_", cache_key, "_", gene, ".qs"))
+save_cocoa_cache <- function(cache_dir, dataset_hash, results, filter_list, comparison_meta, gene) {
+  cache_key <- create_cache_key(dataset_hash, filter_list, comparison_meta); cache_file <- file.path(cache_dir, paste0("cocoa_", cache_key, "_", gene, ".qs"))
   cache_data <- list(dataset_hash = dataset_hash, results = results, filter_list = filter_list, comparison_meta = comparison_meta, timestamp = Sys.time(), gene = gene, type = "COCOA")
   qs::qsave(cache_data, cache_file)
 }
@@ -1571,11 +1579,11 @@ save_cocoa_cache <- function(dataset_hash, results, filter_list, comparison_meta
 # Cache a GO Enrichment run for the History tab. `settings` carries the GO
 # sidebar inputs so a saved run can be fully restored; comparison_meta is
 # filled with GO-shaped values so list_cached_analyses() builds a uniform row.
-save_go_cache <- function(dataset_hash, go_results, settings) {
+save_go_cache <- function(cache_dir, dataset_hash, go_results, settings) {
   key_str <- paste(dataset_hash, settings$data_source, settings$mode,
                    settings$ontology, settings$p_cut, settings$q_cut,
                    settings$logfc_cut, sep = "_")
-  cache_file <- file.path(CACHE_DIR, paste0("go_", digest(key_str, algo = "md5"), ".qs"))
+  cache_file <- file.path(cache_dir, paste0("go_", digest(key_str, algo = "md5"), ".qs"))
   mode_label <- switch(settings$mode, up = "Upregulated", down = "Downregulated",
                        all = "All significant genes (combined)",
                        compare = "Compare Up vs Down", settings$mode)
@@ -1586,8 +1594,8 @@ save_go_cache <- function(dataset_hash, go_results, settings) {
   qs::qsave(cache_data, cache_file)
 }
 
-list_cached_analyses <- function() {
-  files <- list.files(CACHE_DIR, pattern = "^(dea_|cocoa_|go_).+\\.(rds|qs)$", full.names = TRUE); if (length(files) == 0) return(NULL)
+list_cached_analyses <- function(cache_dir) {
+  files <- list.files(cache_dir, pattern = "^(dea_|cocoa_|go_).+\\.(rds|qs)$", full.names = TRUE); if (length(files) == 0) return(NULL)
   hist_list <- lapply(files, function(f) { tryCatch({ data <- if(grepl("\\.qs$", f)) qs::qread(f) else readRDS(f); data$cache_file_path <- basename(f); if (is.null(data$gene) || data$gene == "") data$gene <- "All Genes"; if (is.null(data$type)) data$type <- "DEA"; return(data) }, error = function(e) NULL) })
   hist_list <- hist_list[!sapply(hist_list, is.null)]; if (length(hist_list) == 0) return(NULL)
   df <- do.call(rbind, lapply(hist_list, function(h) { data.frame(type = h$type, gene = h$gene, desc = paste(h$comparison_meta$col, paste(h$comparison_meta$groups, collapse = "/"), sep = ": "), cache_file = h$cache_file_path, timestamp = h$timestamp, stringsAsFactors = FALSE) }))
@@ -2555,6 +2563,15 @@ ui <- navbarPage(
 
 server <- function(input, output, session) {
   
+  # Per-session, ephemeral analysis cache. In a public multi-user deployment the
+  # DEA / COCOA / GO result caches must NOT persist across page reloads or be
+  # visible to other visitors, so each session gets its own folder under CACHE_DIR
+  # keyed by the session token. It is wiped when the session ends (reload /
+  # disconnect; see session$onSessionEnded below), so a fresh reload always starts
+  # with an empty History.
+  session_cache_dir <- file.path(CACHE_DIR, paste0("session_", session$token))
+  dir.create(session_cache_dir, recursive = TRUE, showWarnings = FALSE)
+
   vals <- reactiveValues(
     data = default_load$data, dataset_hash = default_load$hash, umap_calculated = !is.null(default_load$data),
     global_plot_data = NULL, # Cached DF for plotting (Embeddings + Metadata)
@@ -4815,7 +4832,7 @@ server <- function(input, output, session) {
                       COCOA_MAX_CELLS = COCOA_MAX_CELLS,
                       species_cfg = species_cfg),
     packages = c("Matrix", "geneCOCOA", "dplyr", "Seurat", "msigdbr"), seed = TRUE) %...>% (function(result) {
-      if (length(result$res) > 0) { vals$analysis_res <- result$res; vals$analysis_meta <- list(col = meta_col, groups = groups); vals$cocoa_gene_used <- gene; vals$cocoa_filters_used <- filters; save_cocoa_cache(vals$dataset_hash, result$res, filters, vals$analysis_meta, gene) } else { vals$error_msg <- if(length(result$logs)>0) paste("Failed:", paste(result$logs, collapse="; ")) else "No significant pathways." }
+      if (length(result$res) > 0) { vals$analysis_res <- result$res; vals$analysis_meta <- list(col = meta_col, groups = groups); vals$cocoa_gene_used <- gene; vals$cocoa_filters_used <- filters; save_cocoa_cache(session_cache_dir, vals$dataset_hash, result$res, filters, vals$analysis_meta, gene) } else { vals$error_msg <- if(length(result$logs)>0) paste("Failed:", paste(result$logs, collapse="; ")) else "No significant pathways." }
     }) %...!% (function(err) { vals$error_msg <- paste("Async Error:", err$message) }) %>% finally(function() {
       vals$is_analyzing <- FALSE; session$sendCustomMessage("stop_timer", list()); shinyjs::hide("cocoa_loading_overlay"); 
     })
@@ -5031,7 +5048,7 @@ server <- function(input, output, session) {
     future({
       run_dea_worker(subset_counts, subset_meta, meta_col, group1, group2) 
     }, globals=list(run_dea_worker=run_dea_worker, subset_counts=subset_counts, subset_meta=subset_meta, group1=group1, group2=group2, meta_col=meta_col), packages = c("Seurat", "presto", "Matrix"), seed = TRUE) %...>% (function(res) {
-      if (!is.null(res) && nrow(res) > 0) { vals$dea_results <- res;  vals$dea_tested_genes <- res$gene ; vals$dea_filters_used <- filters; vals$dea_meta_used <- list(col=meta_col, g1=group1, g2=group2); save_dea_cache(hash_in, res, filters, list(col=meta_col, groups=c(group1, group2)), gene_in) } else {
+      if (!is.null(res) && nrow(res) > 0) { vals$dea_results <- res;  vals$dea_tested_genes <- res$gene ; vals$dea_filters_used <- filters; vals$dea_meta_used <- list(col=meta_col, g1=group1, g2=group2); save_dea_cache(session_cache_dir, hash_in, res, filters, list(col=meta_col, groups=c(group1, group2)), gene_in) } else {
         vals$dea_error_msg <- "No results returned."
       }
     }) %...!% (function(err) { vals$dea_error_msg <- paste("Async Error:", err$message) }) %>% finally(function() {
@@ -5447,7 +5464,7 @@ server <- function(input, output, session) {
     seed = TRUE) %...>% (function(res) {
       if (!is.null(res)) {
         vals$go_results <- res
-        tryCatch(save_go_cache(hash_in, res, go_settings), error = function(e) NULL)
+        tryCatch(save_go_cache(session_cache_dir, hash_in, res, go_settings), error = function(e) NULL)
       } else {
         vals$go_error_msg <- "No results returned from GO enrichment."
       }
@@ -5709,7 +5726,7 @@ server <- function(input, output, session) {
   # ===========================================================================
   
   observeEvent(input$trigger_load, {
-    file_path <- file.path(CACHE_DIR, input$trigger_load)
+    file_path <- file.path(session_cache_dir, input$trigger_load)
     if (file.exists(file_path)) {
       tryCatch({
         cache_data <- if(grepl("\\.qs$", file_path)) qs::qread(file_path) else readRDS(file_path)
@@ -5751,9 +5768,10 @@ server <- function(input, output, session) {
       }, error = function(e) showNotification("Error loading history.", type = "error", duration = NULL))
     }
   })
-  output$history_list <- renderUI({ input$refresh_history; hist <- list_cached_analyses(); if (is.null(hist)) return(p(style = "text-align: center; color: #999;", icon("info-circle"), " No history.")); tagList(lapply(1:nrow(hist), function(i) { h <- hist[i, ]; type_badge <- if(h$type == "COCOA") span(class="type-badge COCOA", "COCOA") else if(h$type == "GO") span(class="type-badge GO", "GO") else span(class="type-badge DEA", "DEA"); div(class = "history-item-row", onclick = paste0("Shiny.setInputValue('trigger_load', '", h$cache_file, "', {priority: 'event'});"), fluidRow(column(8, type_badge, strong(h$gene), br(), span(style="font-size:12px;", h$desc)), column(4, style="text-align:right;", span(style="font-size:10px;", format(h$timestamp, "%m-%d %H:%M"))))) })) })
+  output$history_list <- renderUI({ input$refresh_history; hist <- list_cached_analyses(session_cache_dir); if (is.null(hist)) return(p(style = "text-align: center; color: #999;", icon("info-circle"), " No history.")); tagList(lapply(1:nrow(hist), function(i) { h <- hist[i, ]; type_badge <- if(h$type == "COCOA") span(class="type-badge COCOA", "COCOA") else if(h$type == "GO") span(class="type-badge GO", "GO") else span(class="type-badge DEA", "DEA"); div(class = "history-item-row", onclick = paste0("Shiny.setInputValue('trigger_load', '", h$cache_file, "', {priority: 'event'});"), fluidRow(column(8, type_badge, strong(h$gene), br(), span(style="font-size:12px;", h$desc)), column(4, style="text-align:right;", span(style="font-size:10px;", format(h$timestamp, "%m-%d %H:%M"))))) })) })
   
   session$onSessionEnded(function() {
+    unlink(session_cache_dir, recursive = TRUE, force = TRUE)
     gc()
   })
 }
