@@ -1,4 +1,4 @@
-# AtlasLens: metadata-centric exploration and analysis of single-cell atlases
+# AtlasLens: Metadata-centric exploration and analysis of single-cell atlases
 
 **The source  code behind the Shiny application for reproducible exploration of single-cell RNA-seq atlases.**
 
