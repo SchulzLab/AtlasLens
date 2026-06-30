@@ -1,0 +1,70 @@
+# ============================================================
+# AtlasLens documentation — MkDocs configuration
+# Edit the values marked with  # <-- EDIT  to suit your app.
+# ============================================================
+
+site_name: AtlasLens
+site_description: AtlasLens — metadata-centric exploration and analysis of single-cell atlases
+site_author: AtlasLens Team                                          # <-- EDIT
+site_url: https://atlaslens.readthedocs.io/
+
+# --- Theme: the Material theme gives the "Read the Docs" look ---
+theme:
+  name: material
+  language: en
+  logo: assets/logo-header.png   # full dark logo lockup in the top-left header
+  favicon: assets/favicon.png    # browser tab icon
+  palette:
+    # Light mode
+    - scheme: default
+      primary: indigo            # <-- EDIT: pick any Material color
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    # Dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.instant     # fast page loads
+    - navigation.top         # back-to-top button
+    - navigation.footer      # Next / Previous links (like SNEEP)
+    - navigation.sections    # group pages in the sidebar
+    - search.suggest
+    - search.highlight
+    - content.code.copy      # copy button on code blocks
+    - toc.integrate
+
+# --- Sidebar navigation. Add/rename/reorder pages here. ---
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Features: features.md
+  - User guide: step-by-step.md
+  - FAQ: faq.md
+  - References: references.md
+
+# --- Nice-to-have Markdown extensions (admonitions, tabs, etc.) ---
+markdown_extensions:
+  - admonition            # tip/note/warning boxes
+  - attr_list             # image sizing, etc.
+  - md_in_html
+  - sane_lists            # numbered lists honour their start number (e.g. 2,3,4)
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences  # nicer code blocks
+  - pymdownx.tabbed:
+      alternate_style: true
+
+plugins:
+  - search
+
+# --- Custom styling (sizes the header logo, hides duplicate title text) ---
+extra_css:
+  - stylesheets/extra.css

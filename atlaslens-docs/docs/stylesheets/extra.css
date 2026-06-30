@@ -1,0 +1,108 @@
+/* ===========================================================================
+   AtlasLens custom styling
+   =========================================================================== */
+
+/* Brand colours (work on both light and dark themes) */
+:root {
+  --al-indigo: #4F46E5;
+  --al-indigo-light: #6366F1;
+  --al-teal: #0EA5A4;
+  --al-tint: rgba(79, 70, 229, 0.06);
+}
+[data-md-color-scheme="slate"] {
+  --al-tint: rgba(129, 140, 248, 0.12);
+}
+
+/* --- Header logo: show the full lockup, hide the duplicate title text --- */
+.md-header__button.md-logo img,
+.md-nav__title .md-nav__button.md-logo img {
+  height: 1.9rem;
+  width: auto;
+}
+.md-header__title .md-header__topic:first-child {
+  display: none;
+}
+
+/* --- Tab section headings (h2): give each one a clear coloured rule so a new
+       section is obvious as you scroll. --- */
+.md-typeset h2 {
+  color: var(--al-indigo);
+  margin-top: 2.6em;
+  padding-bottom: 0.3em;
+  border-bottom: 3px solid var(--al-indigo);
+}
+[data-md-color-scheme="slate"] .md-typeset h2 {
+  color: var(--al-indigo-light);
+  border-bottom-color: var(--al-indigo-light);
+}
+
+/* --- Sub-tab headings (h3): teal left-accent bar --- */
+.md-typeset h3 {
+  color: var(--al-teal);
+  border-left: 4px solid var(--al-teal);
+  padding-left: 0.6em;
+  margin-top: 2em;
+}
+
+/* --- Figures: soft border, rounded corners, light shadow, centred caption --- */
+.md-typeset figure img {
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 8px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08);
+}
+.md-typeset figcaption {
+  color: var(--al-teal);
+  font-style: italic;
+  font-size: 0.85em;
+  margin-top: 0.5em;
+}
+
+/* --- Numbered callout lists: tint the markers in brand indigo --- */
+.md-typeset ol > li::marker {
+  color: var(--al-indigo);
+  font-weight: 700;
+}
+
+/* --- Tables: indigo header row --- */
+.md-typeset table:not([class]) th {
+  background-color: var(--al-indigo);
+  color: #ffffff;
+}
+
+/* --- Inline code: subtle brand tint --- */
+.md-typeset :not(pre) > code {
+  background-color: var(--al-tint);
+}
+
+/* ===========================================================================
+   Left sidebar (navigation / contents): make topic vs. sub-topic hierarchy
+   clear — bold top-level topics, bulleted + indented sub-topics.
+   =========================================================================== */
+
+/* Top-level topics (pages / sections) — bolder and slightly larger */
+.md-nav--primary > .md-nav__list > .md-nav__item > .md-nav__link,
+.md-nav--primary > .md-nav__list > .md-nav__item > label.md-nav__link {
+  font-weight: 700;
+}
+
+/* Sub-topics (headings shown under a page) — teal bullet + indent */
+.md-nav--primary .md-nav .md-nav__link {
+  position: relative;
+  padding-left: 1.1em;
+}
+.md-nav--primary .md-nav .md-nav__link::before {
+  content: "•";
+  position: absolute;
+  left: 0.2em;
+  color: var(--al-teal);
+  font-weight: 700;
+}
+
+/* Deeper sub-topics (e.g. sub-tabs) — hollow bullet, further indent */
+.md-nav--primary .md-nav .md-nav .md-nav__link {
+  padding-left: 1.4em;
+}
+.md-nav--primary .md-nav .md-nav .md-nav__link::before {
+  content: "◦";
+  left: 0.5em;
+}
