@@ -8,6 +8,8 @@
 
 <p align="center">
   📖 <b><a href="https://atlaslens.readthedocs.io/">Read the full documentation</a></b>
+  &nbsp;·&nbsp;
+  🔬 <b><a href="https://atlaslens.uni-frankfurt.de/">Try the live showcase</a></b>
 </p>
 
 ---
