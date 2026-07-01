@@ -35,8 +35,13 @@ Full documentation is hosted at **[atlaslens.readthedocs.io](https://atlaslens.r
 ## Citation
 
 AtlasLens is not yet formally published — a preprint will be available on bioRxiv
-soon. In the meantime, please reference the source code and the archived release
-(Zenodo): [doi.org/10.5281/zenodo.20666624](https://doi.org/10.5281/zenodo.20666624).
+soon. In the meantime, please cite:
+- **Source code** (Zenodo): [doi.org/10.5281/zenodo.21100033](https://doi.org/10.5281/zenodo.21100033)
+- **Processed datasets** (Zenodo): [doi.org/10.5281/zenodo.20666624](https://doi.org/10.5281/zenodo.20666624)
+
+Ashrafiyan, S., Kosaretskii, I., & Schulz, M. H. (2026). *AtlasLens: Metadata-centric
+exploration and analysis of single-cell atlases.* Zenodo.
+
 See the [References](https://atlaslens.readthedocs.io/en/latest/references/) page for
 datasets and the underlying tools.
 
